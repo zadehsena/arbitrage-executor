@@ -340,12 +340,8 @@ async fn discover(
     );
     let k = k?;
     let p = p?;
-    println!(
-        "{} discovery: {} Kalshi open events | {} Polymarket open events",
-        sport.label,
-        k.len(),
-        p.len()
-    );
+    let kalshi_event_count = k.len();
+    let polymarket_event_count = p.len();
     let mut remaining = k;
     let mut matches = Vec::new();
     for p in p {
@@ -428,6 +424,12 @@ async fn discover(
             });
         }
     }
+    let batch_count = subscription_batches(&out).len();
+    println!(
+        "\n\x1b[2m{} discovery\n   Kalshi:       {kalshi_event_count} open events\n   Polymarket:   {polymarket_event_count} open events\n   Matched:      {} games\n   Batches:      {batch_count}\x1b[0m",
+        sport.label,
+        out.len()
+    );
     Ok(out)
 }
 
@@ -851,10 +853,6 @@ async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
     let (mut ps, _) = connect_async(pr).await?;
     ks.send(Message::Text(json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":tickers}}).to_string().into())).await?;
     ps.send(Message::Text(json!({"subscribe":{"requestId":"read-only-scanner","subscriptionType":"SUBSCRIPTION_TYPE_MARKET_DATA","marketSlugs":slugs}}).to_string().into())).await?;
-    println!(
-        "Read-only streaming scanner: {} matched games. Fresh books required; no order routes exist.",
-        pairs.len()
-    );
     // These books intentionally exist only for one connection session. A reconnect
     // starts empty and waits for new snapshots before any candidate can be emitted.
     let (mut kb, mut pb, mut pending, mut emitted) = (
@@ -918,11 +916,6 @@ fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
 
 async fn run_batches(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
     let batches = subscription_batches(pairs);
-    println!(
-        "Subscription plan: {} matched games across {} independent batch(es).",
-        pairs.len(),
-        batches.len()
-    );
     let results = join_all(batches.iter().map(|batch| run_session(batch))).await;
     for result in results {
         result?;
@@ -1007,7 +1000,9 @@ async fn scan_forever(selection: &str, sports: &[Sport]) -> Result<(), Box<dyn E
         };
         match run_batches(&pairs).await {
             Ok(()) => {
-                println!("{selection}: refreshing matched-market subscriptions.");
+                println!(
+                    "------------------------------------------\n\x1b[2m{selection}: refreshing matched-market subscriptions.\x1b[0m"
+                );
                 reconnect_attempt = 0;
             }
             Err(error) => {
