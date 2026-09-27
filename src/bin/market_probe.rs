@@ -120,6 +120,12 @@ fn same_team(left: &str, right: &str) -> bool {
         && (left == right || left.contains(&right) || right.contains(&left))
 }
 
+fn kalshi_winner(title: &str) -> Option<&str> {
+    title
+        .strip_suffix(" wins")
+        .or_else(|| title.strip_prefix("Will ")?.split_once(" win the ").map(|(team, _)| team))
+}
+
 fn event_team_keys(value: &str) -> Option<[String; 2]> {
     let teams: Vec<_> = value.split("vs").map(canonical_team).collect();
     (teams.len() == 2).then(|| [teams[0].clone(), teams[1].clone()])
@@ -318,7 +324,7 @@ fn kalshi_moneyline_markets(payload: &Value) -> Vec<MarketRef> {
         .into_iter()
         .flatten()
         .filter_map(|market| {
-            let outcome = market["title"].as_str()?.strip_suffix(" wins")?.to_owned();
+            let outcome = kalshi_winner(market["title"].as_str()?)?.to_owned();
             let id = market["ticker"].as_str()?.to_owned();
             Some(MarketRef {
                 outcome,
@@ -351,6 +357,7 @@ fn polymarket_moneyline_markets(payload: &Value) -> Vec<MarketRef> {
                 .filter_map(move |(index, side)| {
                     let outcome = side["team"]["safeName"]
                         .as_str()
+                        .filter(|name| !name.is_empty())
                         .or_else(|| side["team"]["name"].as_str())?
                         .to_owned();
                     Some(MarketRef {
@@ -474,7 +481,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::event_similarity;
+    use super::{event_similarity, kalshi_winner};
 
     #[test]
     fn matches_abbreviated_mlb_team_names() {
@@ -489,6 +496,14 @@ mod tests {
         assert_eq!(
             event_similarity("Dart vs Lemaitre", "Harriet Dart vs. Tiphanie Lemaitre"),
             1.0
+        );
+    }
+
+    #[test]
+    fn extracts_r6_winner_from_kalshi_question_title() {
+        assert_eq!(
+            kalshi_winner("Will Heretics win the Heretics vs. Rebels Gaming R6 match?"),
+            Some("Heretics")
         );
     }
 }

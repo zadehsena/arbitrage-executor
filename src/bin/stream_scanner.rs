@@ -255,6 +255,12 @@ fn event_similarity(a: &str, b: &str) -> f64 {
     }
 }
 
+fn kalshi_winner(title: &str) -> Option<&str> {
+    title
+        .strip_suffix(" wins")
+        .or_else(|| title.strip_prefix("Will ")?.split_once(" win the ").map(|(team, _)| team))
+}
+
 async fn get(client: &Client, url: String) -> Result<Value, Box<dyn Error>> {
     Ok(client
         .get(url)
@@ -368,7 +374,7 @@ async fn discover(
             .flatten()
             .filter_map(|m| {
                 Some((
-                    m["title"].as_str()?.strip_suffix(" wins")?.into(),
+                    kalshi_winner(m["title"].as_str()?)?.into(),
                     m["ticker"].as_str()?.into(),
                 ))
             })
@@ -395,6 +401,7 @@ async fn discover(
             .filter_map(|s| {
                 s["team"]["safeName"]
                     .as_str()
+                    .filter(|name| !name.is_empty())
                     .or_else(|| s["team"]["name"].as_str())
                     .map(str::to_owned)
             })
@@ -797,6 +804,14 @@ mod tests {
             1.0
         );
     }
+
+    #[test]
+    fn extracts_r6_winner_from_kalshi_question_title() {
+        assert_eq!(
+            kalshi_winner("Will Heretics win the Heretics vs. Rebels Gaming R6 match?"),
+            Some("Heretics")
+        );
+    }
 }
 
 async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
@@ -929,11 +944,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let cfb = scan_forever("cfb", selected_sports("cfb").expect("supported selection"));
         let nfl = scan_forever("nfl", selected_sports("nfl").expect("supported selection"));
         let mlb = scan_forever("mlb", selected_sports("mlb").expect("supported selection"));
+        let cs2 = scan_forever("cs2", selected_sports("cs2").expect("supported selection"));
+        let valorant = scan_forever(
+            "valorant",
+            selected_sports("valorant").expect("supported selection"),
+        );
+        let dota2 = scan_forever(
+            "dota2",
+            selected_sports("dota2").expect("supported selection"),
+        );
+        let lol = scan_forever("lol", selected_sports("lol").expect("supported selection"));
+        let r6 = scan_forever("r6", selected_sports("r6").expect("supported selection"));
         let tennis = scan_forever(
             "tennis",
             selected_sports("tennis").expect("supported selection"),
         );
-        tokio::try_join!(cfb, nfl, mlb, tennis)?;
+        tokio::try_join!(cfb, nfl, mlb, cs2, valorant, dota2, lol, r6, tennis)?;
         return Ok(());
     }
     let sports = selected_sports(&selection)

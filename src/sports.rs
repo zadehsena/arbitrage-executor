@@ -25,6 +25,36 @@ const MLB: [Sport; 1] = [Sport {
     polymarket_league: "mlb",
 }];
 
+const CS2: [Sport; 1] = [Sport {
+    label: "CS2",
+    kalshi_series: "KXCS2GAME",
+    polymarket_league: "cs2",
+}];
+
+const VALORANT: [Sport; 1] = [Sport {
+    label: "VALORANT",
+    kalshi_series: "KXVALORANTGAME",
+    polymarket_league: "valorant",
+}];
+
+const DOTA2: [Sport; 1] = [Sport {
+    label: "DOTA2",
+    kalshi_series: "KXDOTA2GAME",
+    polymarket_league: "dota2",
+}];
+
+const LOL: [Sport; 1] = [Sport {
+    label: "LOL",
+    kalshi_series: "KXLOLGAME",
+    polymarket_league: "lol",
+}];
+
+const R6: [Sport; 1] = [Sport {
+    label: "R6",
+    kalshi_series: "KXR6GAME",
+    polymarket_league: "r6",
+}];
+
 // Tennis is divided by tour at both venues. The `tennis` selection intentionally
 // includes both so users do not need to run separate ATP and WTA scanners.
 const TENNIS: [Sport; 2] = [
@@ -45,13 +75,18 @@ pub fn selected_sports(selection: &str) -> Option<&'static [Sport]> {
         "cfb" => Some(&CFB),
         "nfl" => Some(&NFL),
         "mlb" => Some(&MLB),
+        "cs2" => Some(&CS2),
+        "valorant" => Some(&VALORANT),
+        "dota2" => Some(&DOTA2),
+        "lol" => Some(&LOL),
+        "r6" => Some(&R6),
         "tennis" => Some(&TENNIS),
         _ => None,
     }
 }
 
-pub const SPORTS_USAGE: &str = "[cfb|nfl|mlb|tennis]";
-pub const SCANNER_USAGE: &str = "[cfb|nfl|mlb|tennis|all]";
+pub const SPORTS_USAGE: &str = "[cfb|nfl|mlb|tennis|cs2|valorant|dota2|lol|r6]";
+pub const SCANNER_USAGE: &str = "[cfb|nfl|mlb|tennis|cs2|valorant|dota2|lol|r6|all]";
 
 #[cfg(test)]
 mod tests {
@@ -70,5 +105,20 @@ mod tests {
         let mlb = selected_sports("mlb").expect("mlb is supported");
         assert_eq!(mlb[0].kalshi_series, "KXMLBGAME");
         assert_eq!(mlb[0].polymarket_league, "mlb");
+    }
+
+    #[test]
+    fn esports_games_use_match_winner_series() {
+        for (selection, kalshi_series, polymarket_league) in [
+            ("cs2", "KXCS2GAME", "cs2"),
+            ("valorant", "KXVALORANTGAME", "valorant"),
+            ("dota2", "KXDOTA2GAME", "dota2"),
+            ("lol", "KXLOLGAME", "lol"),
+            ("r6", "KXR6GAME", "r6"),
+        ] {
+            let sport = selected_sports(selection).expect("esports game is supported");
+            assert_eq!(sport[0].kalshi_series, kalshi_series);
+            assert_eq!(sport[0].polymarket_league, polymarket_league);
+        }
     }
 }

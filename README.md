@@ -35,10 +35,11 @@ submit trades. On a stream disconnect it clears both books, reconnects with
 exponential backoff, and waits for fresh snapshots; it also refreshes the
 matched-market universe every five minutes.
 
-Both tools accept `cfb`, `nfl`, `mlb`, or `tennis` (default: `cfb`). The
-`tennis` option discovers both ATP and WTA match-winner markets. The scanner
-also accepts `all`, which runs each sport independently in one process and
-splits subscriptions before either venue's 100-market cap.
+Both tools accept `cfb`, `nfl`, `mlb`, `tennis`, `cs2`, `valorant`, `dota2`,
+`lol`, or `r6` (default: `cfb`). The `tennis` option discovers both ATP and
+WTA match-winner markets. The scanner also accepts `all`, which runs each
+sport independently in one process and splits subscriptions before either
+venue's 100-market cap.
 
 Candidates are simulated across up to 25 whole contracts of L2 book depth and
 must survive a fresh update from both venues. They are dry-run observations,
