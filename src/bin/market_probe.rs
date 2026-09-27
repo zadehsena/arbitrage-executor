@@ -1,3 +1,4 @@
+use arbitrage_executor::sports::{SPORTS_USAGE, selected_sports};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer as _, pkcs8::DecodePrivateKey as _};
 use rand::rngs::OsRng;
@@ -73,12 +74,69 @@ fn normalize(value: &str) -> String {
         .collect()
 }
 
+fn canonical_team(value: &str) -> String {
+    let normalized = normalize(value);
+    match normalized.as_str() {
+        "arizona" | "arizonadiamondbacks" => "arizonadiamondbacks",
+        "atlanta" | "atlantabraves" => "atlantabraves",
+        "as" | "athletics" | "oakland" | "oaklandathletics" => "athletics",
+        "baltimore" | "baltimoreorioles" => "baltimoreorioles",
+        "boston" | "bostonredsox" => "bostonredsox",
+        "chicagoc" | "chicagocubs" => "chicagocubs",
+        "chicagows" | "chicagowhitesox" => "chicagowhitesox",
+        "cincinnati" | "cincinnatireds" => "cincinnatireds",
+        "cleveland" | "clevelandguardians" => "clevelandguardians",
+        "colorado" | "coloradorockies" => "coloradorockies",
+        "detroit" | "detroittigers" => "detroittigers",
+        "houston" | "houstonastros" => "houstonastros",
+        "kansascity" | "kansascityroyals" => "kansascityroyals",
+        "losangelesa" | "losangelesangels" => "losangelesangels",
+        "losangelesd" | "losangelesdodgers" => "losangelesdodgers",
+        "miami" | "miamimarlins" => "miamimarlins",
+        "milwaukee" | "milwaukeebrewers" => "milwaukeebrewers",
+        "minnesota" | "minnesotatwins" => "minnesotatwins",
+        "newyorkm" | "newyorkmets" => "newyorkmets",
+        "newyorky" | "newyorkyankees" => "newyorkyankees",
+        "philadelphia" | "philadelphiaphillies" => "philadelphiaphillies",
+        "pittsburgh" | "pittsburghpirates" => "pittsburghpirates",
+        "sandiego" | "sandiegopadres" => "sandiegopadres",
+        "sanfrancisco" | "sanfranciscogiants" => "sanfranciscogiants",
+        "seattle" | "seattlemariners" => "seattlemariners",
+        "stlouis" | "stlouiscardinals" => "stlouiscardinals",
+        "tampabay" | "tampabayrays" => "tampabayrays",
+        "texas" | "texasrangers" => "texasrangers",
+        "toronto" | "torontobluejays" => "torontobluejays",
+        "washington" | "washingtonnationals" => "washingtonnationals",
+        _ => normalized.as_str(),
+    }
+    .to_owned()
+}
+
 fn same_team(left: &str, right: &str) -> bool {
-    let left = normalize(left);
-    let right = normalize(right);
+    let left = canonical_team(left);
+    let right = canonical_team(right);
     !left.is_empty()
         && !right.is_empty()
         && (left == right || left.contains(&right) || right.contains(&left))
+}
+
+fn event_team_keys(value: &str) -> Option<[String; 2]> {
+    let teams: Vec<_> = value.split("vs").map(canonical_team).collect();
+    (teams.len() == 2).then(|| [teams[0].clone(), teams[1].clone()])
+}
+
+fn event_similarity(left: &str, right: &str) -> f64 {
+    let title_similarity = similarity(left, right);
+    match (event_team_keys(left), event_team_keys(right)) {
+        (Some(left), Some(right)) => {
+            let shared = left
+                .iter()
+                .filter(|team| right.iter().any(|other| same_team(team, other)))
+                .count();
+            title_similarity.max(shared as f64 / 2.0)
+        }
+        _ => title_similarity,
+    }
 }
 
 fn number(value: Option<&Value>) -> Option<f64> {
@@ -242,7 +300,7 @@ fn match_events(
         let Some((index, score)) = remaining
             .iter()
             .enumerate()
-            .map(|(index, event)| (index, similarity(&event.title, &poly.title)))
+            .map(|(index, event)| (index, event_similarity(&event.title, &poly.title)))
             .max_by(|left, right| left.1.total_cmp(&right.1))
         else {
             continue;
@@ -391,25 +449,46 @@ async fn inspect_match(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
-    let league = env::args().nth(1).unwrap_or_else(|| "cfb".to_owned());
-    let series = match league.as_str() {
-        "cfb" => "KXNCAAFGAME",
-        "nfl" => "KXNFLGAME",
-        _ => return Err("Usage: cargo run --bin market-probe -- [cfb|nfl]".into()),
-    };
+    let selection = env::args().nth(1).unwrap_or_else(|| "cfb".to_owned());
+    let sports = selected_sports(&selection)
+        .ok_or_else(|| format!("Usage: cargo run --bin market_probe -- {SPORTS_USAGE}"))?;
     let client = Client::builder()
         .user_agent("arbitrage-executor-dry-run/0.1")
         .build()?;
-    let (kalshi, polymarket) = event_refs(&client, &league, series, 40).await?;
-    let matches = match_events(kalshi, polymarket);
-    println!(
-        "Read-only executable probe: {} likely {} event matches. Only GET market-data endpoints are called.",
-        matches.len(),
-        league.to_uppercase()
-    );
-    for (kalshi, polymarket, score) in matches.into_iter().take(5) {
-        inspect_match(&client, &kalshi, &polymarket, score).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    for sport in sports {
+        let (kalshi, polymarket) =
+            event_refs(&client, sport.polymarket_league, sport.kalshi_series, 40).await?;
+        let matches = match_events(kalshi, polymarket);
+        println!(
+            "Read-only executable probe: {} likely {} event matches. Only GET market-data endpoints are called.",
+            matches.len(),
+            sport.label
+        );
+        for (kalshi, polymarket, score) in matches.into_iter().take(5) {
+            inspect_match(&client, &kalshi, &polymarket, score).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_similarity;
+
+    #[test]
+    fn matches_abbreviated_mlb_team_names() {
+        assert_eq!(
+            event_similarity("New York M vs Washington", "New York Mets vs. Washington Nationals"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn matches_surname_only_tennis_titles() {
+        assert_eq!(
+            event_similarity("Dart vs Lemaitre", "Harriet Dart vs. Tiphanie Lemaitre"),
+            1.0
+        );
+    }
 }

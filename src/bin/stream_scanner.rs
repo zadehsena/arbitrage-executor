@@ -3,11 +3,12 @@
 //! It only opens market-data WebSockets and appends pre-fee candidates to a
 //! local journal. There are intentionally no order, balance, or portfolio APIs.
 
+use arbitrage_executor::sports::{SCANNER_USAGE, Sport, selected_sports};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer as _, pkcs8::DecodePrivateKey as _};
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::{SinkExt as _, StreamExt as _, future::join_all};
 use rand::rngs::OsRng;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rsa::{
     RsaPrivateKey,
     pkcs1::DecodeRsaPrivateKey as _,
@@ -22,7 +23,6 @@ use std::{
     error::Error,
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio_tungstenite::{
@@ -42,10 +42,10 @@ const KALSHI_TAKER_FEE_RATE: f64 = 0.07;
 const POLYMARKET_US_TAKER_FEE_RATE: f64 = 0.0695;
 const MIN_NET_PROFIT_DOLLARS: f64 = 0.01;
 const MAX_SIMULATED_CONTRACTS: u64 = 25;
-const RULES_APPROVAL_FILE: &str = "rules-approved.json";
 const MAX_AGE: Duration = Duration::from_secs(2);
 const DISCOVERY_REFRESH: Duration = Duration::from_secs(300);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_MARKETS_PER_SUBSCRIPTION: usize = 100;
 
 #[derive(Clone)]
 struct Event {
@@ -54,6 +54,7 @@ struct Event {
 }
 #[derive(Clone)]
 struct Pair {
+    sport: &'static str,
     title: String,
     kalshi: [String; 2],
     teams: [String; 2],
@@ -104,8 +105,116 @@ fn normal(v: &str) -> String {
         .collect()
 }
 fn same_team(a: &str, b: &str) -> bool {
-    let (a, b) = (normal(a), normal(b));
-    !a.is_empty() && !b.is_empty() && (a == b || a.contains(&b) || b.contains(&a))
+    let (a, b) = (canonical_team(a), canonical_team(b));
+    !a.is_empty()
+        && !b.is_empty()
+        && (a == b
+            || a.contains(&b)
+            || b.contains(&a)
+            || (team_city(&a).is_some() && team_city(&a) == team_city(&b)))
+}
+fn team_city(value: &str) -> Option<&'static str> {
+    match value {
+        "arizona" | "arizonadiamondbacks" | "arizonacardinals" => Some("arizona"),
+        "atlanta" | "atlantabraves" | "atlantafalcons" => Some("atlanta"),
+        "baltimore" | "baltimoreorioles" | "baltimoreravens" => Some("baltimore"),
+        "carolina" | "carolinapanthers" => Some("carolina"),
+        "chicagocubs" | "chicagowhitesox" | "chicagobears" => Some("chicago"),
+        "cincinnatireds" | "cincinnatibengals" => Some("cincinnati"),
+        "clevelandguardians" | "clevelandbrowns" => Some("cleveland"),
+        "dallas" | "dallascowboys" => Some("dallas"),
+        "denver" | "denverbroncos" => Some("denver"),
+        "detroit" | "detroittigers" | "detroitlions" => Some("detroit"),
+        "greenbay" | "greenbaypackers" => Some("greenbay"),
+        "houston" | "houstonastros" | "houstontexans" => Some("houston"),
+        "indianapolis" | "indianapoliscolts" => Some("indianapolis"),
+        "jacksonville" | "jacksonvillejaguars" => Some("jacksonville"),
+        "kansascityroyals" | "kansascitychiefs" => Some("kansascity"),
+        "lasvegas" | "lasvegasraiders" => Some("lasvegas"),
+        "losangelesangels" | "losangelesdodgers" | "losangeleschargers" | "losangelesrams" => Some("losangeles"),
+        "miamimarlins" | "miamidolphins" => Some("miami"),
+        "minnesotatwins" | "minnesotavikings" => Some("minnesota"),
+        "newengland" | "newenglandpatriots" => Some("newengland"),
+        "neworleans" | "neworleanssaints" => Some("neworleans"),
+        "philadelphiaphillies" | "philadelphiaeagles" => Some("philadelphia"),
+        "pittsburghpirates" | "pittsburghsteelers" => Some("pittsburgh"),
+        "sandiegopadres" => Some("sandiego"),
+        "sanfranciscogiants" | "sanfrancisco49ers" => Some("sanfrancisco"),
+        "seattlemariners" | "seattleseahawks" => Some("seattle"),
+        "tampabayrays" | "tampabaybuccaneers" => Some("tampabay"),
+        "tennessee" | "tennesseetitans" => Some("tennessee"),
+        "washingtonnationals" | "washingtoncommanders" => Some("washington"),
+        _ => None,
+    }
+}
+fn canonical_team(value: &str) -> String {
+    let normalized = normal(value);
+    match normalized.as_str() {
+        "aricardinals" | "arizonacardinals" => "arizonacardinals",
+        "atlfalcons" | "atlantafalcons" => "atlantafalcons",
+        "bufbills" | "buffalobills" => "buffalobills",
+        "balravens" | "baltimoreravens" => "baltimoreravens",
+        "carpanthers" | "carolinapanthers" => "carolinapanthers",
+        "chibears" | "chicagobears" => "chicagobears",
+        "cinbengals" | "cincinnatibengals" => "cincinnatibengals",
+        "clebrowns" | "clevelandbrowns" => "clevelandbrowns",
+        "dalcowboys" | "dallascowboys" => "dallascowboys",
+        "denbroncos" | "denverbroncos" => "denverbroncos",
+        "detlions" | "detroitlions" => "detroitlions",
+        "gbpackers" | "greenbaypackers" => "greenbaypackers",
+        "houtexans" | "houstontexans" => "houstontexans",
+        "indcolts" | "indianapoliscolts" => "indianapoliscolts",
+        "jacjaguars" | "jacksonvillejaguars" => "jacksonvillejaguars",
+        "kcchiefs" | "kansascitychiefs" => "kansascitychiefs",
+        "lachargers" | "losangelesc" | "losangeleschargers" => "losangeleschargers",
+        "larams" | "losangelesr" | "losangelesrams" => "losangelesrams",
+        "lvraiders" | "lasvegasraiders" => "lasvegasraiders",
+        "miadolphins" | "miamidolphins" => "miamidolphins",
+        "minvikings" | "minnesotavikings" => "minnesotavikings",
+        "nepatriots" | "newenglandpatriots" => "newenglandpatriots",
+        "nosaints" | "neworleanssaints" => "neworleanssaints",
+        "nyjets" | "newyorkj" | "newyorkjets" => "newyorkjets",
+        "nygiants" | "newyorkg" | "newyorkgiants" => "newyorkgiants",
+        "phieagles" | "philadelphiaeagles" => "philadelphiaeagles",
+        "pitsteelers" | "pittsburghsteelers" => "pittsburghsteelers",
+        "sf49ers" | "sanfrancisco49ers" => "sanfrancisco49ers",
+        "seaseahawks" | "seattleseahawks" => "seattleseahawks",
+        "tbbuccaneers" | "tampabaybuccaneers" => "tampabaybuccaneers",
+        "tentitans" | "tennesseetitans" => "tennesseetitans",
+        "wascommanders" | "washingtoncommanders" => "washingtoncommanders",
+        "arizona" | "arizonadiamondbacks" => "arizonadiamondbacks",
+        "atlanta" | "atlantabraves" => "atlantabraves",
+        "as" | "athletics" | "oakland" | "oaklandathletics" => "athletics",
+        "baltimore" | "baltimoreorioles" => "baltimoreorioles",
+        "boston" | "bostonredsox" => "bostonredsox",
+        "chicagoc" | "chicagocubs" => "chicagocubs",
+        "chicagows" | "chicagowhitesox" => "chicagowhitesox",
+        "cincinnati" | "cincinnatireds" => "cincinnatireds",
+        "cleveland" | "clevelandguardians" => "clevelandguardians",
+        "colorado" | "coloradorockies" => "coloradorockies",
+        "detroit" | "detroittigers" => "detroittigers",
+        "houston" | "houstonastros" => "houstonastros",
+        "kansascity" | "kansascityroyals" => "kansascityroyals",
+        "losangelesa" | "losangelesangels" => "losangelesangels",
+        "losangelesd" | "losangelesdodgers" => "losangelesdodgers",
+        "miami" | "miamimarlins" => "miamimarlins",
+        "milwaukee" | "milwaukeebrewers" => "milwaukeebrewers",
+        "minnesota" | "minnesotatwins" => "minnesotatwins",
+        "newyorkm" | "newyorkmets" => "newyorkmets",
+        "newyorky" | "newyorkyankees" => "newyorkyankees",
+        "philadelphia" | "philadelphiaphillies" => "philadelphiaphillies",
+        "pittsburgh" | "pittsburghpirates" => "pittsburghpirates",
+        "sandiego" | "sandiegopadres" => "sandiegopadres",
+        "sanfrancisco" | "sanfranciscogiants" => "sanfranciscogiants",
+        "seattle" | "seattlemariners" => "seattlemariners",
+        "stlouis" | "stlouiscardinals" => "stlouiscardinals",
+        "tampabay" | "tampabayrays" => "tampabayrays",
+        "texas" | "texasrangers" => "texasrangers",
+        "toronto" | "torontobluejays" => "torontobluejays",
+        "washington" | "washingtonnationals" => "washingtonnationals",
+        _ => normalized.as_str(),
+    }
+    .to_owned()
 }
 fn words(v: &str) -> HashSet<String> {
     v.to_lowercase()
@@ -128,6 +237,23 @@ fn similarity(a: &str, b: &str) -> f64 {
         a.intersection(&b).count() as f64 / a.union(&b).count() as f64
     }
 }
+fn event_team_keys(value: &str) -> Option<[String; 2]> {
+    let teams: Vec<_> = value.split("vs").map(canonical_team).collect();
+    (teams.len() == 2).then(|| [teams[0].clone(), teams[1].clone()])
+}
+fn event_similarity(a: &str, b: &str) -> f64 {
+    let title_similarity = similarity(a, b);
+    match (event_team_keys(a), event_team_keys(b)) {
+        (Some(a), Some(b)) => {
+            let shared = a
+                .iter()
+                .filter(|team| b.iter().any(|other| same_team(team, other)))
+                .count();
+            title_similarity.max(shared as f64 / 2.0)
+        }
+        _ => title_similarity,
+    }
+}
 
 async fn get(client: &Client, url: String) -> Result<Value, Box<dyn Error>> {
     Ok(client
@@ -139,49 +265,88 @@ async fn get(client: &Client, url: String) -> Result<Value, Box<dyn Error>> {
         .await?)
 }
 
+fn events(payload: &Value, id_field: &str) -> Vec<Event> {
+    payload["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            Some(Event {
+                id: event[id_field].as_str()?.into(),
+                title: event["title"].as_str()?.into(),
+            })
+        })
+        .collect()
+}
+
+async fn kalshi_events(client: &Client, series: &str) -> Result<Vec<Event>, Box<dyn Error>> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut url = Url::parse(&format!("{KALSHI_REST}/events"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("series_ticker", series);
+            query.append_pair("status", "open");
+            query.append_pair("limit", "100");
+            if let Some(cursor) = &cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let payload = get(client, url.into()) .await?;
+        all.extend(events(&payload, "event_ticker"));
+        cursor = payload["cursor"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if cursor.is_none() {
+            return Ok(all);
+        }
+    }
+}
+
+async fn polymarket_events(client: &Client, league: &str) -> Result<Vec<Event>, Box<dyn Error>> {
+    let mut all = Vec::new();
+    let mut offset = 0;
+    loop {
+        let payload = get(
+            client,
+            format!("{POLY_REST}/v2/leagues/{league}/events?limit=100&offset={offset}"),
+        )
+        .await?;
+        let page = events(&payload, "slug");
+        let count = page.len();
+        all.extend(page);
+        if count < 100 {
+            return Ok(all);
+        }
+        offset += count;
+    }
+}
+
 async fn discover(
     client: &Client,
-    league: &str,
-    series: &str,
+    sport: Sport,
 ) -> Result<Vec<Pair>, Box<dyn Error>> {
     let (k, p) = tokio::join!(
-        get(
-            client,
-            format!("{KALSHI_REST}/events?series_ticker={series}&status=open&limit=100")
-        ),
-        get(
-            client,
-            format!("{POLY_REST}/v2/leagues/{league}/events?limit=100&offset=0")
-        )
+        kalshi_events(client, sport.kalshi_series),
+        polymarket_events(client, sport.polymarket_league)
     );
-    let k: Vec<Event> = k?["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| {
-            Some(Event {
-                id: e["event_ticker"].as_str()?.into(),
-                title: e["title"].as_str()?.into(),
-            })
-        })
-        .collect();
+    let k = k?;
+    let p = p?;
+    println!(
+        "{} discovery: {} Kalshi open events | {} Polymarket open events",
+        sport.label,
+        k.len(),
+        p.len()
+    );
     let mut remaining = k;
     let mut matches = Vec::new();
-    for p in p?["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| {
-            Some(Event {
-                id: e["slug"].as_str()?.into(),
-                title: e["title"].as_str()?.into(),
-            })
-        })
-    {
+    for p in p {
         if let Some((i, score)) = remaining
             .iter()
             .enumerate()
-            .map(|(i, k)| (i, similarity(&k.title, &p.title)))
+            .map(|(i, k)| (i, event_similarity(&k.title, &p.title)))
             .max_by(|a, b| a.1.total_cmp(&b.1))
         {
             if score >= 0.72 {
@@ -247,6 +412,7 @@ async fn discover(
         }
         if teams.iter().all(|t| !t.is_empty()) {
             out.push(Pair {
+                sport: sport.label,
                 title: p.title,
                 kalshi: tickers,
                 teams,
@@ -455,22 +621,10 @@ fn polymarket_fill(book: &PolyBook, buy_long: bool, target: u64) -> Fill {
     fill
 }
 
-fn approved_events() -> Result<HashSet<String>, Box<dyn Error>> {
-    if !Path::new(RULES_APPROVAL_FILE).exists() {
-        return Ok(HashSet::new());
-    }
-    Ok(
-        serde_json::from_str::<Vec<String>>(&fs::read_to_string(RULES_APPROVAL_FILE)?)?
-            .into_iter()
-            .collect(),
-    )
-}
-
 fn candidate(
     pairs: &[Pair],
     kb: &HashMap<String, KalshiBook>,
     pb: &HashMap<String, PolyBook>,
-    approved: &HashSet<String>,
     pending: &mut HashMap<String, Observation>,
     emitted: &mut HashMap<String, Observation>,
 ) -> Result<(), Box<dyn Error>> {
@@ -513,9 +667,6 @@ fn candidate(
                 polymarket_generation: poly.generation,
             };
             if contracts > 0 && net_profit >= MIN_NET_PROFIT_DOLLARS {
-                if !approved.contains(&pair.title) {
-                    continue;
-                }
                 let Some(previous) = pending.get(&key).copied() else {
                     pending.insert(key, observation);
                     continue;
@@ -531,7 +682,8 @@ fn candidate(
                 emitted.insert(key.clone(), observation);
                 pending.insert(key, observation);
                 println!(
-                    "CONFIRMED NET CANDIDATE +${net_profit:.2} on {contracts} contracts | {} | Kalshi {} ${:.4} avg + ${:.4} fee ({} levels), Polymarket {} ${:.4} avg + ${:.4} fee ({} levels)",
+                    "CONFIRMED NET CANDIDATE [{}] +${net_profit:.2} on {contracts} contracts | {} | Kalshi {} ${:.4} avg + ${:.4} fee ({} levels), Polymarket {} ${:.4} avg + ${:.4} fee ({} levels)",
+                    pair.sport,
                     pair.title,
                     pair.teams[i],
                     kalshi_fill.cost / contracts as f64,
@@ -542,7 +694,7 @@ fn candidate(
                     polymarket_fill.fee,
                     polymarket_fill.levels,
                 );
-                let line = json!({"kind":"confirmed_net_candidate","event":pair.title,"kalshi_outcome":pair.teams[i],"kalshi_average_price":kalshi_fill.cost/contracts as f64,"kalshi_fee":kalshi_fill.fee,"kalshi_levels":kalshi_fill.levels,"polymarket_outcome":opposite_team,"polymarket_average_price":polymarket_fill.cost/contracts as f64,"polymarket_fee":polymarket_fill.fee,"polymarket_levels":polymarket_fill.levels,"contracts":contracts,"gross_profit":gross_profit,"net_profit":net_profit,"note":"dry run only; exact rules were manually approved, but fill risk remains"});
+                let line = json!({"kind":"confirmed_net_candidate","sport":pair.sport,"event":pair.title,"kalshi_outcome":pair.teams[i],"kalshi_average_price":kalshi_fill.cost/contracts as f64,"kalshi_fee":kalshi_fill.fee,"kalshi_levels":kalshi_fill.levels,"polymarket_outcome":opposite_team,"polymarket_average_price":polymarket_fill.cost/contracts as f64,"polymarket_fee":polymarket_fill.fee,"polymarket_levels":polymarket_fill.levels,"contracts":contracts,"gross_profit":gross_profit,"net_profit":net_profit,"note":"dry run only; settlement-rule parity and fill risk remain unverified"});
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -561,6 +713,7 @@ mod tests {
     #[test]
     fn pairs_each_kalshi_outcome_with_the_opposite_polymarket_outcome() {
         let pair = Pair {
+            sport: "test",
             title: "A vs B".into(),
             kalshi: ["K-A".into(), "K-B".into()],
             teams: ["A".into(), "B".into()],
@@ -569,6 +722,29 @@ mod tests {
         };
         assert!(!same_team(&pair.teams[1], &pair.poly_long_team));
         assert!(same_team(&pair.teams[0], &pair.poly_long_team));
+    }
+
+    #[test]
+    fn splits_subscriptions_before_the_market_cap() {
+        let pair = Pair {
+            sport: "test",
+            title: "A vs B".into(),
+            kalshi: ["K-A".into(), "K-B".into()],
+            teams: ["A".into(), "B".into()],
+            poly_slug: "pm-a-b".into(),
+            poly_long_team: "A".into(),
+        };
+        let pairs = (0..51)
+            .map(|index| Pair {
+                kalshi: [format!("K-{index}-A"), format!("K-{index}-B")],
+                poly_slug: format!("pm-{index}"),
+                ..pair.clone()
+            })
+            .collect::<Vec<_>>();
+        let batches = subscription_batches(&pairs);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 50);
+        assert_eq!(batches[1].len(), 1);
     }
 
     #[test]
@@ -597,9 +773,33 @@ mod tests {
         assert!((fill.cost - 1.75).abs() < 1e-9);
         assert!(fill.fee > 0.0);
     }
+
+    #[test]
+    fn matches_abbreviated_and_surname_only_event_titles() {
+        assert_eq!(
+            event_similarity("New York M vs Washington", "New York Mets vs. Washington Nationals"),
+            1.0
+        );
+        assert_eq!(
+            event_similarity("Dart vs Lemaitre", "Harriet Dart vs. Tiphanie Lemaitre"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn matches_abbreviated_nfl_team_names() {
+        assert_eq!(
+            event_similarity("Los Angeles C vs Buffalo", "LA Chargers vs BUF Bills"),
+            1.0
+        );
+        assert_eq!(
+            event_similarity("New York J vs Detroit", "NY Jets vs DET Lions"),
+            1.0
+        );
+    }
 }
 
-async fn run_session(pairs: &[Pair], approved: &HashSet<String>) -> Result<(), Box<dyn Error>> {
+async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
     let tickers: Vec<String> = pairs
         .iter()
         .flat_map(|pair| pair.kalshi.clone())
@@ -612,8 +812,8 @@ async fn run_session(pairs: &[Pair], approved: &HashSet<String>) -> Result<(), B
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    if slugs.len() > 100 {
-        return Err("Polymarket permits at most 100 markets per WebSocket subscription".into());
+    if tickers.len() > MAX_MARKETS_PER_SUBSCRIPTION || slugs.len() > MAX_MARKETS_PER_SUBSCRIPTION {
+        return Err("a venue subscription exceeds the 100-market limit".into());
     }
     let t = now()?;
     let kr = request(
@@ -662,18 +862,58 @@ async fn run_session(pairs: &[Pair], approved: &HashSet<String>) -> Result<(), B
                         Some("orderbook_delta") => k_delta(&value, &mut kb),
                         _ => {}
                     }
-                    candidate(pairs, &kb, &pb, approved, &mut pending, &mut emitted)?;
+                    candidate(pairs, &kb, &pb, &mut pending, &mut emitted)?;
                 }
             }
             message = ps.next() => {
                 let message = message.ok_or("Polymarket WebSocket closed")??;
                 if let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
                     p_book(&value, &mut pb);
-                    candidate(pairs, &kb, &pb, approved, &mut pending, &mut emitted)?;
+                    candidate(pairs, &kb, &pb, &mut pending, &mut emitted)?;
                 }
             }
         }
     }
+}
+
+fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
+    let mut batches: Vec<Vec<Pair>> = Vec::new();
+    let mut tickers = HashSet::new();
+    let mut slugs = HashSet::new();
+    for pair in pairs {
+        let next_tickers: HashSet<_> = pair.kalshi.iter().cloned().collect();
+        let adds_tickers = next_tickers.iter().filter(|ticker| !tickers.contains(*ticker)).count();
+        let adds_slug = usize::from(!slugs.contains(&pair.poly_slug));
+        if !batches.is_empty()
+            && (tickers.len() + adds_tickers > MAX_MARKETS_PER_SUBSCRIPTION
+                || slugs.len() + adds_slug > MAX_MARKETS_PER_SUBSCRIPTION)
+        {
+            batches.push(Vec::new());
+            tickers.clear();
+            slugs.clear();
+        }
+        if batches.is_empty() {
+            batches.push(Vec::new());
+        }
+        tickers.extend(next_tickers);
+        slugs.insert(pair.poly_slug.clone());
+        batches.last_mut().expect("batch exists").push(pair.clone());
+    }
+    batches
+}
+
+async fn run_batches(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
+    let batches = subscription_batches(pairs);
+    println!(
+        "Subscription plan: {} matched games across {} independent batch(es).",
+        pairs.len(),
+        batches.len()
+    );
+    let results = join_all(batches.iter().map(|batch| run_session(batch))).await;
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 fn reconnect_delay(attempt: u32) -> Duration {
@@ -684,47 +924,61 @@ fn reconnect_delay(attempt: u32) -> Duration {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
-    let league = env::args().nth(1).unwrap_or_else(|| "cfb".into());
-    let series = match league.as_str() {
-        "cfb" => "KXNCAAFGAME",
-        "nfl" => "KXNFLGAME",
-        _ => return Err("Usage: cargo run --bin stream_scanner -- [cfb|nfl]".into()),
-    };
+    let selection = env::args().nth(1).unwrap_or_else(|| "cfb".into());
+    if selection == "all" {
+        let cfb = scan_forever("cfb", selected_sports("cfb").expect("supported selection"));
+        let nfl = scan_forever("nfl", selected_sports("nfl").expect("supported selection"));
+        let mlb = scan_forever("mlb", selected_sports("mlb").expect("supported selection"));
+        let tennis = scan_forever(
+            "tennis",
+            selected_sports("tennis").expect("supported selection"),
+        );
+        tokio::try_join!(cfb, nfl, mlb, tennis)?;
+        return Ok(());
+    }
+    let sports = selected_sports(&selection)
+        .ok_or_else(|| format!("Usage: cargo run --bin stream_scanner -- {SCANNER_USAGE}"))?;
+    scan_forever(&selection, sports).await
+}
+
+async fn scan_forever(selection: &str, sports: &[Sport]) -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .user_agent("arbitrage-executor-read-only/0.1")
         .build()?;
     let mut reconnect_attempt = 0;
     loop {
-        let pairs = match discover(&client, &league, series).await {
+        let pairs = match async {
+            let mut pairs = Vec::new();
+            for sport in sports {
+                pairs.extend(discover(&client, *sport).await?);
+            }
+            Ok::<_, Box<dyn Error>>(pairs)
+        }
+        .await
+        {
             Ok(pairs) if !pairs.is_empty() => pairs,
             Ok(_) => {
-                eprintln!("No matched two-way moneylines found; retrying discovery shortly.");
+                eprintln!("{selection}: no matched two-way moneylines found; retrying discovery shortly.");
                 tokio::time::sleep(reconnect_delay(reconnect_attempt)).await;
                 reconnect_attempt += 1;
                 continue;
             }
             Err(error) => {
-                eprintln!("Market discovery failed: {error}. Retrying shortly.");
+                eprintln!("{selection}: market discovery failed: {error}. Retrying shortly.");
                 tokio::time::sleep(reconnect_delay(reconnect_attempt)).await;
                 reconnect_attempt += 1;
                 continue;
             }
         };
-        let approved = approved_events()?;
-        if approved.is_empty() {
-            println!(
-                "No rule approvals loaded from {RULES_APPROVAL_FILE}; candidates will be held."
-            );
-        }
-        match run_session(&pairs, &approved).await {
+        match run_batches(&pairs).await {
             Ok(()) => {
-                println!("Refreshing matched-market subscriptions.");
+                println!("{selection}: refreshing matched-market subscriptions.");
                 reconnect_attempt = 0;
             }
             Err(error) => {
                 let delay = reconnect_delay(reconnect_attempt);
                 eprintln!(
-                    "Market-data stream ended: {error}. Reconnecting in {}s.",
+                    "{selection}: market-data stream ended: {error}. Reconnecting in {}s.",
                     delay.as_secs()
                 );
                 tokio::time::sleep(delay).await;
