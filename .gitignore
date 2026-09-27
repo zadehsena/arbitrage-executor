@@ -1,0 +1,7 @@
+/target/
+*.log
+.env
+signals.json
+execution-journal.jsonl
+scanner-candidates.jsonl
+rules-approved.json
