@@ -689,8 +689,7 @@ fn candidate(
                 emitted.insert(key.clone(), observation);
                 pending.insert(key, observation);
                 println!(
-                    "CONFIRMED NET CANDIDATE [{}] +${net_profit:.2} on {contracts} contracts | {} | Kalshi {} ${:.4} avg + ${:.4} fee ({} levels), Polymarket {} ${:.4} avg + ${:.4} fee ({} levels)",
-                    pair.sport,
+                    "------------------------------------------\n{}\nNet: +${net_profit:.2} on {contracts} contracts\n\nKalshi\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\nPolymarket\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}",
                     pair.title,
                     pair.teams[i],
                     kalshi_fill.cost / contracts as f64,
@@ -940,6 +939,10 @@ fn reconnect_delay(attempt: u32) -> Duration {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
     let selection = env::args().nth(1).unwrap_or_else(|| "cfb".into());
+    if selection == "preview" {
+        print_candidate_preview();
+        return Ok(());
+    }
     if selection == "all" {
         let cfb = scan_forever("cfb", selected_sports("cfb").expect("supported selection"));
         let nfl = scan_forever("nfl", selected_sports("nfl").expect("supported selection"));
@@ -965,6 +968,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sports = selected_sports(&selection)
         .ok_or_else(|| format!("Usage: cargo run --bin stream_scanner -- {SCANNER_USAGE}"))?;
     scan_forever(&selection, sports).await
+}
+
+fn print_candidate_preview() {
+    println!(
+        "------------------------------------------\nLos Angeles Dodgers vs. San Francisco Giants\nNet: +$0.17 on 25 contracts\n\nKalshi\n    Dodgers @ $0.9300\n    Fee: $0.1140 | Levels: 1\nPolymarket\n    Giants @ $0.0550\n    Fee: $0.0900 | Levels: 1\n------------------------------------------\nNew York Yankees vs. Boston Red Sox\nNet: +$1.42 on 50 contracts\n\nKalshi\n    Yankees @ $0.6100\n    Fee: $0.0800 | Levels: 2\nPolymarket\n    Red Sox @ $0.3500\n    Fee: $0.0600 | Levels: 1\n------------------------------------------\nTeam Vitality vs. Natus Vincere\nNet: +$0.64 on 20 contracts\n\nKalshi\n    Team Vitality @ $0.4700\n    Fee: $0.0710 | Levels: 1\nPolymarket\n    Natus Vincere @ $0.4700\n    Fee: $0.0680 | Levels: 3"
+    );
 }
 
 async fn scan_forever(selection: &str, sports: &[Sport]) -> Result<(), Box<dyn Error>> {
