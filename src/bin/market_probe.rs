@@ -353,8 +353,7 @@ fn polymarket_moneyline_markets(payload: &Value) -> Vec<MarketRef> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .enumerate()
-                .filter_map(move |(index, side)| {
+                .filter_map(move |side| {
                     let outcome = side["team"]["safeName"]
                         .as_str()
                         .filter(|name| !name.is_empty())
@@ -363,7 +362,7 @@ fn polymarket_moneyline_markets(payload: &Value) -> Vec<MarketRef> {
                     Some(MarketRef {
                         outcome,
                         id: id.clone()?,
-                        is_short: index == 1,
+                        is_short: !side["long"].as_bool()?,
                     })
                 })
         })
@@ -391,14 +390,16 @@ async fn inspect_match(
     }
     let mut aligned: Vec<(&MarketRef, &MarketRef)> = Vec::new();
     for kalshi_market in &kalshi_markets {
-        if let Some(poly_market) = polymarket_markets
+        let matching = polymarket_markets
             .iter()
-            .find(|market| same_team(&kalshi_market.outcome, &market.outcome))
-        {
-            aligned.push((kalshi_market, poly_market));
+            .filter(|market| same_team(&kalshi_market.outcome, &market.outcome))
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Ok(());
         }
+        aligned.push((kalshi_market, matching[0]));
     }
-    if aligned.len() != 2 {
+    if aligned.len() != 2 || aligned[0].1.outcome == aligned[1].1.outcome {
         return Ok(());
     }
     let first = aligned[0];
@@ -481,7 +482,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_similarity, kalshi_winner};
+    use super::{event_similarity, kalshi_winner, polymarket_moneyline_markets};
+    use serde_json::json;
+
+    #[test]
+    fn moneyline_uses_side_flags_even_when_the_api_reorders_sides() {
+        let payload = json!({"event":{"markets":[{"slug":"game","question":"Who will win in the upcoming game?","marketSides":[
+            {"long":false,"team":{"safeName":"B"}},
+            {"long":true,"team":{"safeName":"A"}}
+        ]}]}});
+        let markets = polymarket_moneyline_markets(&payload);
+        assert_eq!(markets.len(), 2);
+        assert!(markets[0].is_short);
+        assert!(!markets[1].is_short);
+    }
 
     #[test]
     fn matches_abbreviated_mlb_team_names() {

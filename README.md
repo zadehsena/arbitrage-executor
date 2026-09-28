@@ -32,13 +32,21 @@ both WebSocket feeds, and writes qualifying **net-fee candidates** to the
 ignored `scanner-candidates.jsonl`. It uses the current published Kalshi and
 Polymarket US taker-fee formulas for standard sports markets, but does not
 submit trades. On a stream disconnect it clears both books, reconnects with
-exponential backoff, and waits for fresh snapshots; it also refreshes the
-matched-market universe every five minutes.
+exponential backoff, and waits for fresh snapshots. It starts the next market
+discovery one minute before its five-minute subscription refresh.
 
-For NFL, the scanner also discovers full-game spreads and totals. These require
-an exact line match and matching opposite outcomes; first-half and quarter
-markets are excluded. They remain dry-run observations, and their settlement
-rule parity is not automatically verified.
+For NFL and CFB, the scanner also discovers full-game, half, and quarter
+spreads. These require an exact half-point line, matching game period, and matching
+opposite outcomes; a full-game, half, or quarter market is never paired with a
+different scope. NFL and CFB full-game totals are also included. They remain dry-run
+observations, and their settlement-rule parity is not automatically verified.
+
+For NFL it also checks standard full-game player props (passing, rushing, and
+receiving yards; receptions) and team props (points and selected yardage
+totals). For CFB it checks the corresponding team props. Props require an exact
+line, entity, and provider market-type match; period, ladder, season, and
+multi-stat props are excluded. CFB player props are not subscribed because no
+matching single-game Kalshi series has been configured and verified.
 
 Both tools accept `cfb`, `nfl`, `mlb`, `tennis`, `cs2`, `valorant`, `dota2`,
 `lol`, or `r6` (default: `cfb`). The `tennis` option discovers both ATP and
@@ -46,13 +54,16 @@ WTA match-winner markets. The scanner also accepts `all`, which runs each
 sport independently in one process and splits subscriptions before either
 venue's 100-market cap.
 
-Candidates are simulated across up to 25 whole contracts of L2 book depth and
-must survive a fresh update from both venues. They are dry-run observations,
+Candidates are simulated across up to 25 whole contracts of L2 book depth,
+must show at least $0.25 net profit after fees, and must survive a fresh update
+from both venues. They are dry-run observations,
 not proof that both venues' settlement rules are equivalent.
 
 Each scanner candidate explicitly reports that it was not executed and performs
 signed, read-only balance requests that are stored with the candidate in the
-local JSON journal. It does not call order, cancel, or portfolio APIs. Set
+local JSON journal. Incoming book updates evaluate only pairs using the changed
+market; a bounded reporting queue keeps balance requests and journal writes out
+of the market-data loop. It does not call order, cancel, or portfolio APIs. Set
 these ignored `.env` variables before running the scanner:
 
 ```bash
