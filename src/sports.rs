@@ -55,20 +55,19 @@ const R6: [Sport; 1] = [Sport {
     polymarket_league: "r6",
 }];
 
-// Tennis is divided by tour at both venues. The `tennis` selection intentionally
-// includes both so users do not need to run separate ATP and WTA scanners.
-const TENNIS: [Sport; 2] = [
-    Sport {
-        label: "ATP",
-        kalshi_series: "KXATPMATCH",
-        polymarket_league: "atp",
-    },
-    Sport {
-        label: "WTA",
-        kalshi_series: "KXWTAMATCH",
-        polymarket_league: "wta",
-    },
-];
+const ATP_SPORT: Sport = Sport {
+    label: "ATP",
+    kalshi_series: "KXATPMATCH",
+    polymarket_league: "atp",
+};
+const WTA_SPORT: Sport = Sport {
+    label: "WTA",
+    kalshi_series: "KXWTAMATCH",
+    polymarket_league: "wta",
+};
+const ATP: [Sport; 1] = [ATP_SPORT];
+const WTA: [Sport; 1] = [WTA_SPORT];
+const TENNIS: [Sport; 2] = [ATP_SPORT, WTA_SPORT];
 
 pub fn selected_sports(selection: &str) -> Option<&'static [Sport]> {
     match selection {
@@ -80,24 +79,29 @@ pub fn selected_sports(selection: &str) -> Option<&'static [Sport]> {
         "dota2" => Some(&DOTA2),
         "lol" => Some(&LOL),
         "r6" => Some(&R6),
+        "atp" => Some(&ATP),
+        "wta" => Some(&WTA),
         "tennis" => Some(&TENNIS),
         _ => None,
     }
 }
 
-pub const SPORTS_USAGE: &str = "[cfb|nfl|mlb|tennis|cs2|valorant|dota2|lol|r6]";
-pub const SCANNER_USAGE: &str = "[cfb|nfl|mlb|tennis|cs2|valorant|dota2|lol|r6|all]";
+pub const SPORTS_USAGE: &str = "[cfb|nfl|mlb|atp|wta|tennis|cs2|valorant|dota2|lol|r6]";
+pub const SCANNER_USAGE: &str =
+    "[cfb|nfl|mlb|atp|wta|tennis|cs2|valorant|dota2|lol|r6|all|novig-check]";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tennis_includes_both_tours() {
+    fn tennis_tours_can_run_separately_or_together() {
         let tennis = selected_sports("tennis").expect("tennis is supported");
         assert_eq!(tennis.len(), 2);
         assert_eq!(tennis[0].kalshi_series, "KXATPMATCH");
         assert_eq!(tennis[1].kalshi_series, "KXWTAMATCH");
+        assert_eq!(selected_sports("atp"), Some(&tennis[..1]));
+        assert_eq!(selected_sports("wta"), Some(&tennis[1..]));
     }
 
     #[test]
