@@ -1,10 +1,12 @@
 //! Continuous, read-only cross-venue scanner.
 //!
-//! It only opens market-data WebSockets and appends pre-fee candidates to a
-//! local journal. There are intentionally no order, balance, or portfolio APIs.
+//! It only opens market-data WebSockets, reads account balances, and appends
+//! pre-fee candidates to a local journal. There are intentionally no order,
+//! cancel, or portfolio APIs.
 
 use arbitrage_executor::sports::{SCANNER_USAGE, Sport, selected_sports};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::Local;
 use ed25519_dalek::{Signer as _, pkcs8::DecodePrivateKey as _};
 use futures_util::{SinkExt as _, StreamExt as _, future::join_all};
 use rand::rngs::OsRng;
@@ -46,6 +48,7 @@ const MAX_AGE: Duration = Duration::from_secs(2);
 const DISCOVERY_REFRESH: Duration = Duration::from_secs(300);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_MARKETS_PER_SUBSCRIPTION: usize = 100;
+const POLY_PRIVATE_REST: &str = "https://api.polymarket.us";
 
 #[derive(Clone)]
 struct Event {
@@ -81,6 +84,13 @@ struct Fill {
     cost: f64,
     fee: f64,
     levels: usize,
+}
+
+#[derive(serde::Serialize)]
+struct BalanceSnapshot {
+    kalshi: String,
+    polymarket: String,
+    buying_power: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +248,13 @@ fn similarity(a: &str, b: &str) -> f64 {
     }
 }
 fn event_team_keys(value: &str) -> Option<[String; 2]> {
-    let teams: Vec<_> = value.split("vs").map(canonical_team).collect();
+    let teams: Vec<_> = value
+        .split(':')
+        .next()
+        .unwrap_or(value)
+        .split("vs")
+        .map(canonical_team)
+        .collect();
     (teams.len() == 2).then(|| [teams[0].clone(), teams[1].clone()])
 }
 fn event_similarity(a: &str, b: &str) -> f64 {
@@ -259,6 +275,114 @@ fn kalshi_winner(title: &str) -> Option<&str> {
     title
         .strip_suffix(" wins")
         .or_else(|| title.strip_prefix("Will ")?.split_once(" win the ").map(|(team, _)| team))
+}
+
+fn market_team(market: &Value, long: bool) -> Option<String> {
+    market["marketSides"]
+        .as_array()?
+        .iter()
+        .find(|side| side["long"].as_bool() == Some(long))?["team"]["safeName"]
+        .as_str()
+        .or_else(|| market["marketSides"].as_array()?.iter().find(|side| side["long"].as_bool() == Some(long))?["team"]["name"].as_str())
+        .map(str::to_owned)
+}
+
+fn side_label(market: &Value, long: bool) -> Option<String> {
+    market["marketSides"]
+        .as_array()?
+        .iter()
+        .find(|side| side["long"].as_bool() == Some(long))?["description"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn full_game_market(market: &Value, category: &str) -> bool {
+    market["marketType"].as_str() == Some(category)
+        && !market["sportsMarketType"]
+            .as_str()
+            .is_some_and(|scope| scope.contains("half") || scope.contains("quarter"))
+}
+
+fn pair_spreads(kalshi: &Value, polymarket: &Value, sport: Sport) -> Vec<Pair> {
+    let Some(poly_markets) = polymarket.pointer("/event/markets").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    kalshi["markets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|market| {
+            let line = number(market.get("floor_strike"))?;
+            let kalshi_team = market["yes_sub_title"]
+                .as_str()?
+                .strip_suffix(" wins by over")
+                .or_else(|| market["yes_sub_title"].as_str()?.split(" wins by over").next())?
+                .trim()
+                .to_owned();
+            let poly = poly_markets.iter().find(|poly| {
+                if !full_game_market(poly, "spreads") || number(poly.get("line")).is_none_or(|value| value.abs() != line) {
+                    return false;
+                }
+                let long = market_team(poly, true);
+                let short = market_team(poly, false);
+                match (long, short, number(poly.get("line"))) {
+                    (Some(long), Some(short), Some(poly_line)) => {
+                        (same_team(&kalshi_team, &long) && (poly_line + line).abs() < 1e-9)
+                            || (same_team(&kalshi_team, &short) && (poly_line - line).abs() < 1e-9)
+                    }
+                    _ => false,
+                }
+            })?;
+            let long = market_team(poly, true)?;
+            let short = market_team(poly, false)?;
+            let opposite = if same_team(&kalshi_team, &long) {
+                short
+            } else {
+                long.clone()
+            };
+            Some(Pair {
+                sport: sport.label,
+                title: format!("{} — Spread {line:+}", polymarket["event"]["title"].as_str()?),
+                kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
+                teams: [format!("{kalshi_team} -{line}"), format!("{opposite} +{line}")],
+                poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_long_team: format!("{long} -{line}"),
+            })
+        })
+        .collect()
+}
+
+fn pair_totals(kalshi: &Value, polymarket: &Value, sport: Sport) -> Vec<Pair> {
+    let Some(poly_markets) = polymarket.pointer("/event/markets").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    kalshi["markets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|market| {
+            let line = number(market.get("floor_strike"))?;
+            if !market["title"].as_str()?.to_lowercase().starts_with("over ") {
+                return None;
+            }
+            let poly = poly_markets.iter().find(|poly| {
+                full_game_market(poly, "totals")
+                    && number(poly.get("line")).is_some_and(|value| (value - line).abs() < 1e-9)
+                    && side_label(poly, true)
+                        .is_some_and(|label| label.to_lowercase().contains("over"))
+                    && side_label(poly, false)
+                        .is_some_and(|label| label.to_lowercase().contains("under"))
+            })?;
+            Some(Pair {
+                sport: sport.label,
+                title: format!("{} — Total {line}", polymarket["event"]["title"].as_str()?),
+                kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
+                teams: [format!("Over {line}"), format!("Under {line}")],
+                poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_long_team: format!("Over {line}"),
+            })
+        })
+        .collect()
 }
 
 async fn get(client: &Client, url: String) -> Result<Value, Box<dyn Error>> {
@@ -342,6 +466,7 @@ async fn discover(
     let p = p?;
     let kalshi_event_count = k.len();
     let polymarket_event_count = p.len();
+    let polymarket_events_for_derivatives = p.clone();
     let mut remaining = k;
     let mut matches = Vec::new();
     for p in p {
@@ -424,9 +549,38 @@ async fn discover(
             });
         }
     }
+    // NFL spreads and totals live in distinct Kalshi series. Only full-game,
+    // exact-line pairs are admitted; half and quarter markets are excluded.
+    if sport.label == "NFL" {
+        let (spread_events, total_events) = tokio::join!(
+            kalshi_events(client, "KXNFLSPREAD"),
+            kalshi_events(client, "KXNFLTOTAL")
+        );
+        for (events, build_pairs) in [
+            (spread_events?, pair_spreads as fn(&Value, &Value, Sport) -> Vec<Pair>),
+            (total_events?, pair_totals as fn(&Value, &Value, Sport) -> Vec<Pair>),
+        ] {
+            for kalshi_event in events {
+                let Some(poly_event) = polymarket_events_for_derivatives
+                    .iter()
+                    .map(|event| (event, event_similarity(&kalshi_event.title, &event.title)))
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .filter(|(_, score)| *score >= 0.72)
+                    .map(|(event, _)| event)
+                else {
+                    continue;
+                };
+                let (kalshi_detail, poly_detail) = tokio::join!(
+                    get(client, format!("{KALSHI_REST}/events/{}", kalshi_event.id)),
+                    get(client, format!("{POLY_REST}/v1/events/slug/{}", poly_event.id))
+                );
+                out.extend(build_pairs(&kalshi_detail?, &poly_detail?, sport));
+            }
+        }
+    }
     let batch_count = subscription_batches(&out).len();
     println!(
-        "\n\x1b[2m{} discovery\n   Kalshi:       {kalshi_event_count} open events\n   Polymarket:   {polymarket_event_count} open events\n   Matched:      {} games\n   Batches:      {batch_count}\x1b[0m",
+        "\n{} discovery\nKalshi:       {kalshi_event_count} open events\nPolymarket:   {polymarket_event_count} open events\nMatched:      {} games\nBatches:      {batch_count}\n",
         sport.label,
         out.len()
     );
@@ -439,9 +593,13 @@ fn now() -> Result<String, Box<dyn Error>> {
         .as_millis()
         .to_string())
 }
-fn kalshi_sig(t: &str) -> Result<String, Box<dyn Error>> {
+
+fn clock() -> String {
+    Local::now().format("%H:%M:%S").to_string()
+}
+fn kalshi_sig(t: &str, path: &str) -> Result<String, Box<dyn Error>> {
     let pem = fs::read_to_string(env::var("KALSHI_PRIVATE_KEY_PATH")?)?;
-    let msg = format!("{t}GET/trade-api/ws/v2");
+    let msg = format!("{t}GET{path}");
     if let Ok(k) = ed25519_dalek::SigningKey::from_pkcs8_pem(&pem) {
         return Ok(BASE64.encode(k.sign(msg.as_bytes()).to_bytes()));
     };
@@ -452,7 +610,7 @@ fn kalshi_sig(t: &str) -> Result<String, Box<dyn Error>> {
             .to_bytes(),
     ))
 }
-fn poly_sig(t: &str) -> Result<String, Box<dyn Error>> {
+fn poly_sig(t: &str, path: &str) -> Result<String, Box<dyn Error>> {
     let raw = BASE64.decode(env::var("POLYMARKET_US_SECRET_KEY")?)?;
     let raw: [u8; 32] = raw
         .get(..32)
@@ -460,9 +618,79 @@ fn poly_sig(t: &str) -> Result<String, Box<dyn Error>> {
         .try_into()?;
     Ok(BASE64.encode(
         ed25519_dalek::SigningKey::from_bytes(&raw)
-            .sign(format!("{t}GET/v1/ws/markets").as_bytes())
+            .sign(format!("{t}GET{path}").as_bytes())
             .to_bytes(),
     ))
+}
+
+fn dollars(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|value| value as f64))
+            .or_else(|| value.as_str()?.parse().ok())
+    })
+}
+
+async fn kalshi_balance(client: &Client) -> Result<String, Box<dyn Error>> {
+    let path = "/trade-api/v2/portfolio/balance";
+    let timestamp = now()?;
+    let payload = client
+        .get(format!("{KALSHI_REST}/portfolio/balance"))
+        .header("KALSHI-ACCESS-KEY", env::var("KALSHI_API_KEY_ID")?)
+        .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
+        .header("KALSHI-ACCESS-SIGNATURE", kalshi_sig(&timestamp, path)?)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let available = dollars(payload.get("balance_dollars"))
+        .or_else(|| dollars(payload.get("balance")).map(|value| value / 100.0))
+        .ok_or("Kalshi balance response did not include an available balance")?;
+    Ok(format!("${available:.2}"))
+}
+
+async fn polymarket_balance(client: &Client) -> Result<(String, String), Box<dyn Error>> {
+    let path = "/v1/account/balances";
+    let timestamp = now()?;
+    let payload = client
+        .get(format!("{POLY_PRIVATE_REST}{path}"))
+        .header("X-PM-Access-Key", env::var("POLYMARKET_US_KEY_ID")?)
+        .header("X-PM-Timestamp", &timestamp)
+        .header("X-PM-Signature", poly_sig(&timestamp, path)?)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let balance = payload["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|balance| balance["currency"].as_str() == Some("USD"))
+        .or_else(|| payload["balances"].as_array().and_then(|balances| balances.first()))
+        .ok_or("Polymarket balance response did not include a balance")?;
+    let current = dollars(balance.get("currentBalance"))
+        .ok_or("Polymarket balance response did not include currentBalance")?;
+    let buying_power = dollars(balance.get("buyingPower"));
+    Ok((
+        format!("${current:.2}"),
+        buying_power
+            .map(|value| format!("${value:.2}"))
+            .unwrap_or_else(|| "unavailable".into()),
+    ))
+}
+
+async fn balance_snapshot(client: &Client) -> BalanceSnapshot {
+    let (kalshi, polymarket) = tokio::join!(kalshi_balance(client), polymarket_balance(client));
+    let (polymarket, buying_power) = polymarket.unwrap_or_else(|_| ("unavailable".into(), "unavailable".into()));
+    BalanceSnapshot {
+        // Avoid rendering provider errors here: they can include account-specific details.
+        kalshi: kalshi.unwrap_or_else(|_| "unavailable".into()),
+        polymarket,
+        buying_power,
+    }
 }
 fn request(
     url: &str,
@@ -630,7 +858,8 @@ fn polymarket_fill(book: &PolyBook, buy_long: bool, target: u64) -> Fill {
     fill
 }
 
-fn candidate(
+async fn candidate(
+    client: &Client,
     pairs: &[Pair],
     kb: &HashMap<String, KalshiBook>,
     pb: &HashMap<String, PolyBook>,
@@ -690,8 +919,10 @@ fn candidate(
                 }
                 emitted.insert(key.clone(), observation);
                 pending.insert(key, observation);
+                let balances = balance_snapshot(client).await;
                 println!(
-                    "------------------------------------------\n{}\nNet: +${net_profit:.2} on {contracts} contracts\n\nKalshi\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\nPolymarket\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}",
+                    "---\n\n[{}] {}\nNet: +${net_profit:.2} on {contracts} contracts\n\nKalshi\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\nPolymarket\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\nExecution\n    Mode: Dry run\n\nBalances\n    Kalshi:       {}\n    Polymarket:   {}\n    Buying power: {}\n",
+                    clock(),
                     pair.title,
                     pair.teams[i],
                     kalshi_fill.cost / contracts as f64,
@@ -701,8 +932,11 @@ fn candidate(
                     polymarket_fill.cost / contracts as f64,
                     polymarket_fill.fee,
                     polymarket_fill.levels,
+                    balances.kalshi,
+                    balances.polymarket,
+                    balances.buying_power,
                 );
-                let line = json!({"kind":"confirmed_net_candidate","sport":pair.sport,"event":pair.title,"kalshi_outcome":pair.teams[i],"kalshi_average_price":kalshi_fill.cost/contracts as f64,"kalshi_fee":kalshi_fill.fee,"kalshi_levels":kalshi_fill.levels,"polymarket_outcome":opposite_team,"polymarket_average_price":polymarket_fill.cost/contracts as f64,"polymarket_fee":polymarket_fill.fee,"polymarket_levels":polymarket_fill.levels,"contracts":contracts,"gross_profit":gross_profit,"net_profit":net_profit,"note":"dry run only; settlement-rule parity and fill risk remain unverified"});
+                let line = json!({"kind":"confirmed_net_candidate","sport":pair.sport,"event":pair.title,"kalshi_outcome":pair.teams[i],"kalshi_average_price":kalshi_fill.cost/contracts as f64,"kalshi_fee":kalshi_fill.fee,"kalshi_levels":kalshi_fill.levels,"polymarket_outcome":opposite_team,"polymarket_average_price":polymarket_fill.cost/contracts as f64,"polymarket_fee":polymarket_fill.fee,"polymarket_levels":polymarket_fill.levels,"contracts":contracts,"gross_profit":gross_profit,"net_profit":net_profit,"execution":{"status":"not_executed","mode":"dry_run"},"current_balances":balances,"note":"dry run only; settlement-rule parity and fill risk remain unverified"});
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -730,6 +964,40 @@ mod tests {
         };
         assert!(!same_team(&pair.teams[1], &pair.poly_long_team));
         assert!(same_team(&pair.teams[0], &pair.poly_long_team));
+    }
+
+    #[test]
+    fn pairs_only_an_exact_full_game_spread_line() {
+        let kalshi = json!({"markets":[{"ticker":"K-SPREAD","floor_strike":3.5,"yes_sub_title":"A wins by over 3.5 points"}]});
+        let polymarket = json!({"event":{"title":"A vs B","markets":[
+            {"marketType":"spreads","sportsMarketType":"football_team_spread","line":-3.5,"slug":"pm-spread","marketSides":[
+                {"long":true,"team":{"safeName":"A"}}, {"long":false,"team":{"safeName":"B"}}
+            ]},
+            {"marketType":"spreads","sportsMarketType":"football_team_first_half_spread","line":-3.5,"slug":"pm-first-half","marketSides":[
+                {"long":true,"team":{"safeName":"A"}}, {"long":false,"team":{"safeName":"B"}}
+            ]}
+        ]}});
+        let pairs = pair_spreads(&kalshi, &polymarket, selected_sports("nfl").unwrap()[0]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].poly_slug, "pm-spread");
+        assert_eq!(pairs[0].teams, ["A -3.5", "B +3.5"]);
+    }
+
+    #[test]
+    fn pairs_only_an_exact_full_game_total_line() {
+        let kalshi = json!({"markets":[{"ticker":"K-TOTAL","floor_strike":47.5,"title":"Over 47.5 points?"}]});
+        let polymarket = json!({"event":{"title":"A vs B","markets":[
+            {"marketType":"totals","sportsMarketType":"football_game_total","line":47.5,"slug":"pm-total","marketSides":[
+                {"long":true,"description":"Over 47.5"}, {"long":false,"description":"Under 47.5"}
+            ]},
+            {"marketType":"totals","sportsMarketType":"football_game_first_half_total","line":47.5,"slug":"pm-first-half","marketSides":[
+                {"long":true,"description":"Over 47.5"}, {"long":false,"description":"Under 47.5"}
+            ]}
+        ]}});
+        let pairs = pair_totals(&kalshi, &polymarket, selected_sports("nfl").unwrap()[0]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].poly_slug, "pm-total");
+        assert_eq!(pairs[0].teams, ["Over 47.5", "Under 47.5"]);
     }
 
     #[test]
@@ -818,7 +1086,7 @@ mod tests {
 async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
     let tickers: Vec<String> = pairs
         .iter()
-        .flat_map(|pair| pair.kalshi.clone())
+        .flat_map(|pair| pair.kalshi.iter().filter(|ticker| !ticker.is_empty()).cloned())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -837,7 +1105,7 @@ async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
         &[
             ("KALSHI-ACCESS-KEY", env::var("KALSHI_API_KEY_ID")?),
             ("KALSHI-ACCESS-TIMESTAMP", t.clone()),
-            ("KALSHI-ACCESS-SIGNATURE", kalshi_sig(&t)?),
+            ("KALSHI-ACCESS-SIGNATURE", kalshi_sig(&t, "/trade-api/ws/v2")?),
         ],
     )?;
     let t = now()?;
@@ -846,9 +1114,12 @@ async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
         &[
             ("X-PM-Access-Key", env::var("POLYMARKET_US_KEY_ID")?),
             ("X-PM-Timestamp", t.clone()),
-            ("X-PM-Signature", poly_sig(&t)?),
+            ("X-PM-Signature", poly_sig(&t, "/v1/ws/markets")?),
         ],
     )?;
+    let client = Client::builder()
+        .user_agent("arbitrage-executor-read-only/0.1")
+        .build()?;
     let (mut ks, _) = connect_async(kr).await?;
     let (mut ps, _) = connect_async(pr).await?;
     ks.send(Message::Text(json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":tickers}}).to_string().into())).await?;
@@ -874,14 +1145,14 @@ async fn run_session(pairs: &[Pair]) -> Result<(), Box<dyn Error>> {
                         Some("orderbook_delta") => k_delta(&value, &mut kb),
                         _ => {}
                     }
-                    candidate(pairs, &kb, &pb, &mut pending, &mut emitted)?;
+                    candidate(&client, pairs, &kb, &pb, &mut pending, &mut emitted).await?;
                 }
             }
             message = ps.next() => {
                 let message = message.ok_or("Polymarket WebSocket closed")??;
                 if let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
                     p_book(&value, &mut pb);
-                    candidate(pairs, &kb, &pb, &mut pending, &mut emitted)?;
+                    candidate(&client, pairs, &kb, &pb, &mut pending, &mut emitted).await?;
                 }
             }
         }
@@ -893,7 +1164,12 @@ fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
     let mut tickers = HashSet::new();
     let mut slugs = HashSet::new();
     for pair in pairs {
-        let next_tickers: HashSet<_> = pair.kalshi.iter().cloned().collect();
+        let next_tickers: HashSet<_> = pair
+            .kalshi
+            .iter()
+            .filter(|ticker| !ticker.is_empty())
+            .cloned()
+            .collect();
         let adds_tickers = next_tickers.iter().filter(|ticker| !tickers.contains(*ticker)).count();
         let adds_slug = usize::from(!slugs.contains(&pair.poly_slug));
         if !batches.is_empty()
@@ -933,7 +1209,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
     let selection = env::args().nth(1).unwrap_or_else(|| "cfb".into());
     if selection == "preview" {
-        print_candidate_preview();
+        print_candidate_preview().await?;
         return Ok(());
     }
     if selection == "all" {
@@ -963,10 +1239,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     scan_forever(&selection, sports).await
 }
 
-fn print_candidate_preview() {
-    println!(
-        "------------------------------------------\nLos Angeles Dodgers vs. San Francisco Giants\nNet: +$0.17 on 25 contracts\n\nKalshi\n    Dodgers @ $0.9300\n    Fee: $0.1140 | Levels: 1\nPolymarket\n    Giants @ $0.0550\n    Fee: $0.0900 | Levels: 1\n------------------------------------------\nNew York Yankees vs. Boston Red Sox\nNet: +$1.42 on 50 contracts\n\nKalshi\n    Yankees @ $0.6100\n    Fee: $0.0800 | Levels: 2\nPolymarket\n    Red Sox @ $0.3500\n    Fee: $0.0600 | Levels: 1\n------------------------------------------\nTeam Vitality vs. Natus Vincere\nNet: +$0.64 on 20 contracts\n\nKalshi\n    Team Vitality @ $0.4700\n    Fee: $0.0710 | Levels: 1\nPolymarket\n    Natus Vincere @ $0.4700\n    Fee: $0.0680 | Levels: 3"
-    );
+async fn print_candidate_preview() -> Result<(), Box<dyn Error>> {
+    let client = Client::builder()
+        .user_agent("arbitrage-executor-read-only/0.1")
+        .build()?;
+    let balances = balance_snapshot(&client).await;
+    let examples = [
+        ("Los Angeles Dodgers vs. San Francisco Giants", "$0.17", 25, "Dodgers", "$0.9300", "$0.1140", 1, "Giants", "$0.0550", "$0.0900", 1),
+        ("New York Yankees vs. Boston Red Sox", "$1.42", 50, "Yankees", "$0.6100", "$0.0800", 2, "Red Sox", "$0.3500", "$0.0600", 1),
+        ("Team Vitality vs. Natus Vincere", "$0.64", 20, "Team Vitality", "$0.4700", "$0.0710", 1, "Natus Vincere", "$0.4700", "$0.0680", 3),
+    ];
+    for (title, net, contracts, kalshi_team, kalshi_price, kalshi_fee, kalshi_levels, poly_team, poly_price, poly_fee, poly_levels) in examples {
+        println!(
+            "---\n\n[{}] {title}\nNet: +{net} on {contracts} contracts\n\nKalshi\n    {kalshi_team} @ {kalshi_price}\n    Fee: {kalshi_fee} | Levels: {kalshi_levels}\n\nPolymarket\n    {poly_team} @ {poly_price}\n    Fee: {poly_fee} | Levels: {poly_levels}\n\nExecution\n    Mode: Dry run\n\nBalances\n    Kalshi:       {}\n    Polymarket:   {}\n    Buying power: {}\n",
+            clock(),
+            balances.kalshi,
+            balances.polymarket,
+            balances.buying_power,
+        );
+    }
+    Ok(())
 }
 
 async fn scan_forever(selection: &str, sports: &[Sport]) -> Result<(), Box<dyn Error>> {
@@ -1000,9 +1292,7 @@ async fn scan_forever(selection: &str, sports: &[Sport]) -> Result<(), Box<dyn E
         };
         match run_batches(&pairs).await {
             Ok(()) => {
-                println!(
-                    "------------------------------------------\n\x1b[2m{selection}: refreshing matched-market subscriptions.\x1b[0m"
-                );
+                println!("[{}] {}: Refreshing market subscriptions...\n", clock(), selection.to_uppercase());
                 reconnect_attempt = 0;
             }
             Err(error) => {

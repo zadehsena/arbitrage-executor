@@ -35,6 +35,11 @@ submit trades. On a stream disconnect it clears both books, reconnects with
 exponential backoff, and waits for fresh snapshots; it also refreshes the
 matched-market universe every five minutes.
 
+For NFL, the scanner also discovers full-game spreads and totals. These require
+an exact line match and matching opposite outcomes; first-half and quarter
+markets are excluded. They remain dry-run observations, and their settlement
+rule parity is not automatically verified.
+
 Both tools accept `cfb`, `nfl`, `mlb`, `tennis`, `cs2`, `valorant`, `dota2`,
 `lol`, or `r6` (default: `cfb`). The `tennis` option discovers both ATP and
 WTA match-winner markets. The scanner also accepts `all`, which runs each
@@ -44,6 +49,18 @@ venue's 100-market cap.
 Candidates are simulated across up to 25 whole contracts of L2 book depth and
 must survive a fresh update from both venues. They are dry-run observations,
 not proof that both venues' settlement rules are equivalent.
+
+Each scanner candidate explicitly reports that it was not executed and performs
+signed, read-only balance requests that are stored with the candidate in the
+local JSON journal. It does not call order, cancel, or portfolio APIs. Set
+these ignored `.env` variables before running the scanner:
+
+```bash
+KALSHI_API_KEY_ID=...
+KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/kalshi-private-key.pem
+POLYMARKET_US_KEY_ID=...
+POLYMARKET_US_SECRET_KEY=... # base64-encoded Ed25519 private key
+```
 
 ## Before any live-trading work
 
