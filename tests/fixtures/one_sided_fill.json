@@ -1,0 +1,83 @@
+{
+  "plan": {
+    "id": "demo",
+    "quantity_micros": 10000000,
+    "entry_limit_ticks": [
+      4000,
+      5000
+    ],
+    "entry_fee_reserve_microusd": [
+      30000,
+      30000
+    ],
+    "entry_timeout_ms": 1000,
+    "max_unhedged_ms": 200,
+    "max_recovery_ms": 1500,
+    "max_quote_age_ms": 100,
+    "max_loss_microusd": 200000,
+    "max_exit_attempts": 2
+  },
+  "events": [
+    {
+      "now_ms": 0,
+      "event": {
+        "type": "start"
+      }
+    },
+    {
+      "now_ms": 10,
+      "event": {
+        "type": "report",
+        "report": {
+          "client_order_id": "demo-entry-0",
+          "revision": 1,
+          "status": "filled",
+          "filled_micros": 10000000,
+          "notional_microusd": 4000000,
+          "fees_microusd": 20000
+        }
+      }
+    },
+    {
+      "now_ms": 20,
+      "event": {
+        "type": "report",
+        "report": {
+          "client_order_id": "demo-entry-1",
+          "revision": 1,
+          "status": "canceled",
+          "filled_micros": 6000000,
+          "notional_microusd": 3000000,
+          "fees_microusd": 15000
+        }
+      }
+    },
+    {
+      "now_ms": 30,
+      "event": {
+        "type": "exit_quote",
+        "quote": {
+          "venue": "kalshi",
+          "observed_at_ms": 30,
+          "bid_ticks": 3800,
+          "available_micros": 10000000,
+          "fee_bound_microusd": 10000
+        }
+      }
+    },
+    {
+      "now_ms": 40,
+      "event": {
+        "type": "report",
+        "report": {
+          "client_order_id": "demo-exit-1",
+          "revision": 1,
+          "status": "filled",
+          "filled_micros": 4000000,
+          "notional_microusd": 1520000,
+          "fees_microusd": 10000
+        }
+      }
+    }
+  ]
+}

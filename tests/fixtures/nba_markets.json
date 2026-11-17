@@ -1,0 +1,258 @@
+{
+  "kalshi_game": {
+    "event_ticker": "KXNBAGAME-26NOV16CHICLE",
+    "title": "Chicago vs Cleveland",
+    "markets": [
+      {
+        "ticker": "KXNBAGAME-26NOV16CHICLE-CHI",
+        "title": "Chicago wins",
+        "yes_sub_title": "Chicago",
+        "status": "active"
+      },
+      {
+        "ticker": "KXNBAGAME-26NOV16CHICLE-CLE",
+        "title": "Cleveland wins",
+        "yes_sub_title": "Cleveland",
+        "status": "active"
+      }
+    ]
+  },
+  "kalshi_spread": {
+    "title": "Chicago vs Cleveland: Spread",
+    "markets": [
+      {
+        "ticker": "KXNBASPREAD-26NOV16CHICLE-CLE16",
+        "title": "Cleveland wins by over 15.5 points",
+        "yes_sub_title": "Cleveland wins by over 15.5 points",
+        "floor_strike": 15.5,
+        "status": "active"
+      }
+    ]
+  },
+  "kalshi_total": {
+    "title": "Chicago vs Cleveland: Total Points",
+    "markets": [
+      {
+        "ticker": "KXNBATOTAL-26NOV16CHICLE-214",
+        "title": "Full Game: Over 213.5 points scored",
+        "yes_sub_title": "Over 213.5 points",
+        "floor_strike": 213.5,
+        "status": "active"
+      }
+    ]
+  },
+  "polymarket": {
+    "event": {
+      "slug": "nba-chi-cle-2026-11-16",
+      "title": "CHI Bulls vs. CLE Cavaliers",
+      "startDate": "2026-11-17T00:00:00Z",
+      "markets": [
+        {
+          "title": "Chicago Bulls vs Cleveland Cavaliers",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "aec-nba-chi-cle-2026-11-16",
+          "question": "Who will win in the upcoming basketball event CHI Bulls vs CLE Cavaliers scheduled for November 17, 2026 at 12:00 AM UTC?",
+          "sportsMarketType": "basketball_team_full_game_winner",
+          "marketType": "moneyline",
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "Bulls",
+              "long": true,
+              "teamId": 37,
+              "team": {
+                "name": "Chicago Bulls",
+                "safeName": "Bulls"
+              }
+            },
+            {
+              "description": "Cavaliers",
+              "long": false,
+              "teamId": 38,
+              "team": {
+                "name": "Cleveland Cavaliers",
+                "safeName": "Cavaliers"
+              }
+            }
+          ]
+        },
+        {
+          "question": "Will the CHI Bulls cover 15.5 vs the CLE Cavaliers in CHI Bulls vs. CLE Cavaliers?",
+          "slug": "asc-nba-chi-cle-2026-11-16-pos-15pt5",
+          "active": true,
+          "marketType": "spreads",
+          "closed": false,
+          "archived": false,
+          "sportsMarketType": "basketball_team_full_game_spread",
+          "line": 15.5,
+          "marketSides": [
+            {
+              "description": "+15.50",
+              "long": true,
+              "teamId": 37,
+              "team": {
+                "name": "Chicago Bulls",
+                "safeName": "Bulls"
+              }
+            },
+            {
+              "description": "-15.50",
+              "long": false,
+              "teamId": 38,
+              "team": {
+                "name": "Cleveland Cavaliers",
+                "safeName": "Cavaliers"
+              }
+            }
+          ]
+        },
+        {
+          "title": "Over 213.5 total points",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "tsc-nba-chi-cle-2026-11-16-213pt5",
+          "question": "Will the total in CHI Bulls vs. CLE Cavaliers be more than 213.5?",
+          "sportsMarketType": "basketball_team_full_game_total",
+          "marketType": "totals",
+          "line": 213.5,
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "Over",
+              "long": true
+            },
+            {
+              "description": "Under",
+              "long": false
+            }
+          ]
+        },
+        {
+          "title": "Cleveland Cavaliers wins by over 17.5 points in 1st half",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "asc-nba-chi-cle-2026-11-16-fh-pos-17pt5",
+          "question": "Will the CHI Bulls cover +17.5 vs the CLE Cavaliers in the first half of CHI Bulls vs. CLE Cavaliers?",
+          "sportsMarketType": "basketball_team_first_half_spread",
+          "marketType": "spreads",
+          "line": 17.5,
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "+17.50",
+              "long": true,
+              "teamId": 37,
+              "team": {
+                "name": "Chicago Bulls",
+                "safeName": "Bulls"
+              }
+            },
+            {
+              "description": "-17.50",
+              "long": false,
+              "teamId": 38,
+              "team": {
+                "name": "Cleveland Cavaliers",
+                "safeName": "Cavaliers"
+              }
+            }
+          ]
+        },
+        {
+          "title": "Over 101.5 total points in 1st half",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "tsc-nba-chi-cle-2026-11-16-fh-101pt5",
+          "question": "Will the first half total in CHI Bulls vs. CLE Cavaliers be more than 101.5?",
+          "sportsMarketType": "basketball_team_first_half_total",
+          "marketType": "totals",
+          "line": 101.5,
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "Over",
+              "long": true
+            },
+            {
+              "description": "Under",
+              "long": false
+            }
+          ]
+        },
+        {
+          "title": "Chicago Bulls over 97.5 total points",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "tsc-nba-chi-cle-2026-11-16-tt-chi-fg-97pt5",
+          "question": "Will CHI Bulls score more than 97.5 points in CHI Bulls vs. CLE Cavaliers?",
+          "sportsMarketType": "basketball_team_total_points",
+          "marketType": "totals",
+          "line": 97.5,
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "Over",
+              "long": true,
+              "teamId": 37,
+              "team": {
+                "name": "Chicago Bulls",
+                "safeName": "Bulls"
+              }
+            },
+            {
+              "description": "Under",
+              "long": false,
+              "teamId": 37,
+              "team": {
+                "name": "Chicago Bulls",
+                "safeName": "Bulls"
+              }
+            }
+          ]
+        },
+        {
+          "title": "Donovan Mitchell 10+ points",
+          "status": "MARKET_STATUS_OPEN",
+          "slug": "astatc-nba-chi-cle-2026-11-16-pts-donmit-gte10",
+          "question": "Will Donovan Mitchell record at least 10 points in CHI Bulls vs. CLE Cavaliers?",
+          "sportsMarketType": "basketball_player_points",
+          "marketType": "props",
+          "line": 10,
+          "active": true,
+          "closed": false,
+          "archived": false,
+          "marketSides": [
+            {
+              "description": "Yes",
+              "long": true,
+              "teamId": 38,
+              "team": {
+                "name": "Cleveland Cavaliers",
+                "safeName": "Cavaliers"
+              }
+            },
+            {
+              "description": "No",
+              "long": false,
+              "teamId": 38,
+              "team": {
+                "name": "Cleveland Cavaliers",
+                "safeName": "Cavaliers"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sources": [
+    "https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXNBAGAME&status=open&with_nested_markets=true&limit=1",
+    "https://gateway.polymarket.us/v1/events/slug/nba-chi-cle-2026-11-16"
+  ]
+}

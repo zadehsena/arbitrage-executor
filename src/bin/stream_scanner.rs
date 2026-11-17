@@ -4,12 +4,14 @@
 //! net-fee candidates to a local journal. There are intentionally no order,
 //! cancel, or portfolio APIs.
 
-use arbitrage_executor::{
-    novig,
-    sports::{SCANNER_USAGE, Sport, selected_sports},
+use arbitrage_executor::fees::{FeeModel, FeePolicy, LegFees};
+use arbitrage_executor::settlement::{Approvals, ReviewDecision, RuleReview, digest};
+use arbitrage_executor::sports::{
+    SCANNER_USAGE, Sport, college_team_key, nba_team_key, same_college_team, same_nba_team,
+    selected_sports,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Utc};
 use ed25519_dalek::{Signer as _, pkcs8::DecodePrivateKey as _};
 use futures_util::{
     SinkExt as _, StreamExt as _,
@@ -31,7 +33,7 @@ use std::{
     error::Error,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
@@ -44,14 +46,19 @@ use tokio_tungstenite::{
     },
 };
 
+#[path = "stream_scanner/feed.rs"]
+mod feed;
+use feed::{FeedHealth, KalshiIntegrity, PolyIntegrity};
+
+#[path = "stream_scanner/safety.rs"]
+mod safety;
+use safety::{LegSafety, prepare_pair_safety};
+
 const KALSHI_REST: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const POLY_REST: &str = "https://gateway.polymarket.us";
 const KALSHI_WS: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 const POLY_WS: &str = "wss://api.polymarket.us/v1/ws/markets";
-const KALSHI_TAKER_FEE_RATE: f64 = 0.07;
-const POLYMARKET_US_TAKER_FEE_RATE: f64 = 0.0695;
-const MIN_NET_PROFIT_DOLLARS: f64 = 0.25;
-const MAX_SIMULATED_CONTRACTS: u64 = 25;
+const MIN_NET_PROFIT_DOLLARS: f64 = 0.01;
 const MAX_AGE: Duration = Duration::from_secs(2);
 const DISCOVERY_REFRESH: Duration = Duration::from_secs(300);
 const DISCOVERY_PREFETCH_LEAD: Duration = Duration::from_secs(60);
@@ -77,17 +84,11 @@ struct MarketCounts {
     props: usize,
 }
 
-fn discovery_row(label: &str, counts: Option<&MarketCounts>) -> String {
-    match counts {
-        Some(counts) => format!(
-            "{label:<13}{:>7}{:>13}{:>10}{:>9}{:>8}",
-            counts.games, counts.moneylines, counts.spreads, counts.totals, counts.props
-        ),
-        None => format!(
-            "{label:<13}{:>7}{:>13}{:>10}{:>9}{:>8}",
-            "-", "-", "-", "-", "-"
-        ),
-    }
+fn discovery_row(label: &str, counts: &MarketCounts) -> String {
+    format!(
+        "{label:<13}{:>7}{:>13}{:>10}{:>9}{:>8}",
+        counts.games, counts.moneylines, counts.spreads, counts.totals, counts.props
+    )
 }
 
 #[derive(Default)]
@@ -105,7 +106,9 @@ struct Pair {
     kalshi: [String; 2],
     teams: [String; 2],
     poly_slug: String,
+    poly_url: String,
     poly_long_is_first: bool,
+    safety: [Option<Arc<LegSafety>>; 2],
 }
 
 struct PairIndex<'a> {
@@ -113,196 +116,8 @@ struct PairIndex<'a> {
     by_polymarket: HashMap<&'a str, Vec<usize>>,
 }
 
-#[derive(Clone)]
-struct NovigPair {
-    pair_index: usize,
-    market: novig::Market,
-    /// Novig outcome index for each `Pair::teams` entry.
-    aligned: [usize; 2],
-}
-
-#[derive(Default)]
-struct NovigDiscovery {
-    games: usize,
-    moneylines: usize,
-    spreads: usize,
-    totals: usize,
-    props: usize,
-    matches: Vec<NovigPair>,
-}
-
 struct Discovery {
     pairs: Vec<Pair>,
-    novig_pairs: Vec<NovigPair>,
-}
-
-fn novig_same_outcome(sport: &str, a: &str, b: &str) -> bool {
-    match sport {
-        "ATP" | "WTA" => {
-            if same_tennis_player(a, b) {
-                return true;
-            }
-            let abbreviated = |full: &str| {
-                let mut names = full.split_whitespace();
-                let first = names.next()?;
-                let rest = names.collect::<Vec<_>>().join("");
-                let initial = first.chars().next()?.to_ascii_lowercase();
-                (!rest.is_empty()).then(|| format!("{}{}", initial, normal(&rest)))
-            };
-            abbreviated(a).is_some_and(|name| name == normal(b))
-                || abbreviated(b).is_some_and(|name| name == normal(a))
-        }
-        "CS2" | "VALORANT" | "DOTA2" | "LOL" | "R6" => same_esports_team(a, b),
-        "NFL" => {
-            let code = match normal(b).as_str() {
-                "ari" => "arizonacardinals",
-                "atl" => "atlantafalcons",
-                "bal" => "baltimoreravens",
-                "buf" => "buffalobills",
-                "car" => "carolinapanthers",
-                "chi" => "chicagobears",
-                "cin" => "cincinnatibengals",
-                "cle" => "clevelandbrowns",
-                "dal" => "dallascowboys",
-                "den" => "denverbroncos",
-                "det" => "detroitlions",
-                "gb" => "greenbaypackers",
-                "hou" => "houstontexans",
-                "ind" => "indianapoliscolts",
-                "jac" | "jax" => "jacksonvillejaguars",
-                "kc" => "kansascitychiefs",
-                "lv" => "lasvegasraiders",
-                "lac" => "losangeleschargers",
-                "lar" => "losangelesrams",
-                "mia" => "miamidolphins",
-                "min" => "minnesotavikings",
-                "ne" => "newenglandpatriots",
-                "no" => "neworleanssaints",
-                "nyg" => "newyorkgiants",
-                "nyj" => "newyorkjets",
-                "phi" => "philadelphiaeagles",
-                "pit" => "pittsburghsteelers",
-                "sf" => "sanfrancisco49ers",
-                "sea" => "seattleseahawks",
-                "tb" => "tampabaybuccaneers",
-                "ten" => "tennesseetitans",
-                "was" | "wsh" => "washingtoncommanders",
-                _ => return same_team(a, b),
-            };
-            canonical_team(a) == code
-        }
-        "MLB" => {
-            let code = match normal(b).as_str() {
-                "ari" => "arizonadiamondbacks",
-                "atl" => "atlantabraves",
-                "bal" => "baltimoreorioles",
-                "bos" => "bostonredsox",
-                "chc" => "chicagocubs",
-                "cws" => "chicagowhitesox",
-                "cin" => "cincinnatireds",
-                "cle" => "clevelandguardians",
-                "col" => "coloradorockies",
-                "det" => "detroittigers",
-                "hou" => "houstonastros",
-                "kc" => "kansascityroyals",
-                "laa" => "losangelesangels",
-                "lad" => "losangelesdodgers",
-                "mia" => "miamimarlins",
-                "mil" => "milwaukeebrewers",
-                "min" => "minnesotatwins",
-                "nym" => "newyorkmets",
-                "nyy" => "newyorkyankees",
-                "oak" | "ath" => "athletics",
-                "phi" => "philadelphiaphillies",
-                "pit" => "pittsburghpirates",
-                "sd" => "sandiegopadres",
-                "sf" => "sanfranciscogiants",
-                "sea" => "seattlemariners",
-                "stl" => "stlouiscardinals",
-                "tb" => "tampabayrays",
-                "tex" => "texasrangers",
-                "tor" => "torontobluejays",
-                "wsh" | "was" => "washingtonnationals",
-                _ => return same_team(a, b),
-            };
-            canonical_team(a) == code
-        }
-        _ => same_team(a, b),
-    }
-}
-
-fn novig_league(sport: &str) -> Option<&'static str> {
-    match sport {
-        "NFL" => Some("NFL"),
-        "CFB" => Some("NCAAF"),
-        "MLB" => Some("MLB"),
-        "ATP" => Some("ATP"),
-        "WTA" => Some("WTA"),
-        _ => None,
-    }
-}
-
-async fn discover_novig(client: &Client, pairs: &[Pair]) -> Result<NovigDiscovery, Box<dyn Error>> {
-    let sports: HashSet<_> = pairs.iter().map(|pair| pair.sport).collect();
-    let mut discovery = NovigDiscovery::default();
-    for sport in sports {
-        let Some(league) = novig_league(sport) else {
-            continue;
-        };
-        let (inventory, titles) = tokio::try_join!(
-            novig::inventory(client, league),
-            novig::event_titles(client, league)
-        )?;
-        discovery.games += inventory.games;
-        discovery.moneylines += inventory.moneylines;
-        discovery.spreads += inventory.spreads;
-        discovery.totals += inventory.totals;
-        discovery.props += inventory.props;
-        let markets = inventory.markets;
-        for (pair_index, pair) in pairs.iter().enumerate().filter(|(_, pair)| {
-            pair.sport == sport
-                && matches!(pair.market.as_str(), "Full game moneyline" | "Match winner")
-        }) {
-            let candidates: Vec<_> = markets
-                .iter()
-                .filter_map(|market| {
-                    let title = titles.get(&market.event)?.replace(" @ ", " vs. ");
-                    if !matches!(sport, "ATP" | "WTA")
-                        && event_similarity(&pair.title, &title) < 0.72
-                    {
-                        return None;
-                    }
-                    let same = |team: &str, outcome: usize| {
-                        novig_same_outcome(sport, team, &market.outcomes[outcome].1)
-                    };
-                    let aligned = if same(&pair.teams[0], 0) && same(&pair.teams[1], 1) {
-                        [0, 1]
-                    } else if same(&pair.teams[0], 1) && same(&pair.teams[1], 0) {
-                        [1, 0]
-                    } else {
-                        return None;
-                    };
-                    Some((market, aligned))
-                })
-                .collect();
-            // Duplicate fixtures, doubleheaders, and ambiguous markets are skipped.
-            if let [(market, aligned)] = candidates.as_slice() {
-                discovery.matches.push(NovigPair {
-                    pair_index,
-                    market: (*market).clone(),
-                    aligned: *aligned,
-                });
-            }
-        }
-    }
-    let mut market_use = HashMap::<String, usize>::new();
-    for entry in &discovery.matches {
-        *market_use.entry(entry.market.id.clone()).or_default() += 1;
-    }
-    discovery
-        .matches
-        .retain(|entry| market_use[entry.market.id.as_str()] == 1);
-    Ok(discovery)
 }
 
 fn pair_index(pairs: &[Pair]) -> PairIndex<'_> {
@@ -318,11 +133,13 @@ fn pair_index(pairs: &[Pair]) -> PairIndex<'_> {
                 .or_default()
                 .push(position);
         }
-        index
-            .by_polymarket
-            .entry(pair.poly_slug.as_str())
-            .or_default()
-            .push(position);
+        if !pair.poly_slug.is_empty() {
+            index
+                .by_polymarket
+                .entry(pair.poly_slug.as_str())
+                .or_default()
+                .push(position);
+        }
     }
     index
 }
@@ -371,7 +188,7 @@ const NFL_PROP_SERIES: &[PropSeries] = &[
     PropSeries {
         kalshi_series: "KXNFLTEAMTOTAL",
         kind: PropKind::Team,
-        poly_type: "footballteamfullgametotal",
+        poly_type: "footballteampointsfullgametotal",
         label: "Team points",
     },
     PropSeries {
@@ -398,7 +215,7 @@ const CFB_PROP_SERIES: &[PropSeries] = &[
     PropSeries {
         kalshi_series: "KXNCAAFTEAMTOTAL",
         kind: PropKind::Team,
-        poly_type: "footballteamfullgametotal",
+        poly_type: "footballteampointsfullgametotal",
         label: "Team points",
     },
     PropSeries {
@@ -468,6 +285,23 @@ struct SpreadSeries {
     period: &'static str,
     label: &'static str,
 }
+
+const CBB_SPREAD_SERIES: &[SpreadSeries] = &[SpreadSeries {
+    kalshi_series: "KXNCAAMBSPREAD",
+    period: "",
+    label: "Full game",
+}];
+const WCBB_SPREAD_SERIES: &[SpreadSeries] = &[SpreadSeries {
+    kalshi_series: "KXNCAAWBSPREAD",
+    period: "",
+    label: "Full game",
+}];
+
+const NBA_SPREAD_SERIES: &[SpreadSeries] = &[SpreadSeries {
+    kalshi_series: "KXNBASPREAD",
+    period: "",
+    label: "Full game",
+}];
 
 const NFL_SPREAD_SERIES: &[SpreadSeries] = &[
     SpreadSeries {
@@ -570,6 +404,23 @@ struct TotalSeries {
     poly_type: &'static str,
     label: &'static str,
 }
+
+const CBB_TOTAL_SERIES: &[TotalSeries] = &[TotalSeries {
+    kalshi_series: "KXNCAAMBTOTAL",
+    poly_type: "basketballteamfullgametotal",
+    label: "Full game",
+}];
+const WCBB_TOTAL_SERIES: &[TotalSeries] = &[TotalSeries {
+    kalshi_series: "KXNCAAWBTOTAL",
+    poly_type: "basketballteamfullgametotal",
+    label: "Full game",
+}];
+
+const NBA_TOTAL_SERIES: &[TotalSeries] = &[TotalSeries {
+    kalshi_series: "KXNBATOTAL",
+    poly_type: "basketballteamfullgametotal",
+    label: "Full game",
+}];
 
 const NFL_TOTAL_SERIES: &[TotalSeries] = &[TotalSeries {
     kalshi_series: "KXNFLTOTAL",
@@ -675,11 +526,100 @@ struct BalanceSnapshot {
     buying_power: String,
 }
 
+fn kalshi_market_url(ticker: &str) -> String {
+    let mut url = Url::parse("https://kalshi.com/markets/").expect("static Kalshi URL");
+    url.path_segments_mut()
+        .expect("URL supports paths")
+        .pop_if_empty()
+        .push(ticker);
+    url.into()
+}
+
+fn polymarket_market_url(event_slug: &str, market_slug: &str) -> String {
+    let mut url = Url::parse("https://polymarket.us/event/").expect("static Polymarket URL");
+    url.path_segments_mut()
+        .expect("URL supports paths")
+        .pop_if_empty()
+        .push(event_slug);
+    url.query_pairs_mut().append_pair("marketSlug", market_slug);
+    url.into()
+}
+
+fn attach_polymarket_urls(pairs: &mut [Pair], details: &HashMap<String, Value>) {
+    let mut urls = HashMap::new();
+    for (event_slug, detail) in details {
+        for market in detail["event"]["markets"].as_array().into_iter().flatten() {
+            if let Some(slug) = market["slug"].as_str() {
+                urls.insert(slug, polymarket_market_url(event_slug, slug));
+            }
+        }
+    }
+    for pair in pairs {
+        if let Some(url) = urls.get(pair.poly_slug.as_str()) {
+            pair.poly_url = url.clone();
+        }
+    }
+}
+
 struct DisplaySide<'a> {
+    url: &'a str,
+    available: u64,
     outcome: &'a str,
     average_price: f64,
     fee: f64,
     levels: usize,
+}
+
+fn comma_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut result = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(digit);
+    }
+    result
+}
+
+fn compact_position(event: &str, outcome: &str) -> String {
+    let (team, line) = outcome
+        .split_once(" +")
+        .map(|(team, line)| (team, format!(" +{line}")))
+        .or_else(|| {
+            outcome
+                .split_once(" -")
+                .map(|(team, line)| (team, format!(" -{line}")))
+        })
+        .unwrap_or((outcome, String::new()));
+    for event_team in event.split(" vs. ").flat_map(|part| part.split(" vs ")) {
+        let Some(abbreviation) = event_team.split_whitespace().next() else {
+            continue;
+        };
+        if !(2..=4).contains(&abbreviation.len())
+            || !abbreviation.chars().all(|ch| ch.is_ascii_uppercase())
+        {
+            continue;
+        }
+        let city_matches =
+            team_city(&canonical_team(event_team)).is_some_and(|city| normal(team) == city);
+        if same_team(team, event_team) || city_matches {
+            return format!("{abbreviation}{line}");
+        }
+    }
+    outcome.to_owned()
+}
+
+fn terminal_market_link(label: &str, url: &str) -> String {
+    if io::stdout().is_terminal()
+        && env::var("TERM").as_deref() != Ok("dumb")
+        && url.starts_with("https://")
+        && !url.chars().any(char::is_control)
+    {
+        format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+    } else {
+        label.to_owned()
+    }
 }
 
 fn format_candidate_log(
@@ -692,24 +632,93 @@ fn format_candidate_log(
     polymarket: DisplaySide<'_>,
     balances: &BalanceSnapshot,
 ) -> String {
-    format!(
-        "---\n\n[{timestamp}] {event}\nMarket: {market}\nNet: +${net_profit:.2} on {contracts} contracts\n\n\
-         Kalshi\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\n\
-         Polymarket\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\n\
-         Execution\n    Mode: Dry run\n\n\
-         Balances\n    Kalshi:       {}\n    Polymarket:  {}\n    Buying power: {}\n\n---",
-        kalshi.outcome,
-        kalshi.average_price,
-        kalshi.fee,
-        kalshi.levels,
-        polymarket.outcome,
-        polymarket.average_price,
-        polymarket.fee,
-        polymarket.levels,
-        balances.kalshi,
-        balances.polymarket,
-        balances.buying_power,
+    use std::fmt::Write as _;
+
+    let kalshi_required = kalshi.average_price * contracts as f64 + kalshi.fee;
+    let polymarket_required = polymarket.average_price * contracts as f64 + polymarket.fee;
+    let required = kalshi_required + polymarket_required;
+    let roi = if required > 0.0 {
+        net_profit / required * 100.0
+    } else {
+        0.0
+    };
+    let market = market
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rows = [
+        (
+            "Position",
+            compact_position(event, kalshi.outcome),
+            compact_position(event, polymarket.outcome),
+        ),
+        (
+            "Price",
+            format!("${:.4}", kalshi.average_price),
+            format!("${:.4}", polymarket.average_price),
+        ),
+        (
+            "Fee",
+            format!("${:.4}", kalshi.fee),
+            format!("${:.4}", polymarket.fee),
+        ),
+        (
+            "Levels",
+            comma_count(kalshi.levels as u64),
+            comma_count(polymarket.levels as u64),
+        ),
+        (
+            "Visible Depth",
+            comma_count(kalshi.available),
+            comma_count(polymarket.available),
+        ),
+        (
+            "Required",
+            format!("${kalshi_required:.4}"),
+            format!("${polymarket_required:.4}"),
+        ),
+    ];
+    // Expand the first venue column for long player/team names instead of
+    // truncating positions or letting them run into the second venue.
+    let width = rows
+        .iter()
+        .map(|(_, left, _)| left.chars().count() + 3)
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let mut output = format!(
+        "[{timestamp}] {event}\n{market}\n\nNET PROFIT   +${net_profit:.2}    CONTRACTS   {}    ROI   {roi:+.2}%\n\n",
+        comma_count(contracts),
+    );
+    // Pad using the visible label length, excluding hyperlink escape codes.
+    let kalshi_header = terminal_market_link("KALSHI", kalshi.url);
+    let polymarket_header = terminal_market_link("POLYMARKET", polymarket.url);
+    let gap = " ".repeat(width - "KALSHI".len());
+    writeln!(output, "{:17}{kalshi_header}{gap}{polymarket_header}", "").unwrap();
+    for (label, left, right) in rows {
+        writeln!(output, "{label:17}{left:<width$}{right}").unwrap();
+    }
+    writeln!(
+        output,
+        "\n{:17}DRY RUN (depth optimized, balances ignored)",
+        "Execution"
     )
+    .unwrap();
+    writeln!(
+        output,
+        "\n{:17}Kalshi {}  |  Polymarket {}",
+        "Balances", balances.kalshi, balances.polymarket
+    )
+    .unwrap();
+    write!(output, "\n{}", "─".repeat(80)).unwrap();
+    output
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,6 +731,8 @@ struct CandidateRecord {
     timestamp: String,
     pair: Pair,
     kalshi_side: usize,
+    kalshi_available: u64,
+    polymarket_available: u64,
     kalshi_fill: Fill,
     polymarket_fill: Fill,
     contracts: u64,
@@ -729,29 +740,8 @@ struct CandidateRecord {
     net_profit: f64,
 }
 
-struct NovigRecord {
-    timestamp: String,
-    pair: Pair,
-    other_venue: &'static str,
-    other_outcome: String,
-    other_fill: Fill,
-    novig_outcome: String,
-    novig_fill: Fill,
-    contracts: u64,
-    gross_profit: f64,
-    net_profit: f64,
-}
-
-enum ReportRecord {
-    KalshiPolymarket(CandidateRecord),
-    Novig(NovigRecord),
-}
-
 fn number(v: Option<&Value>) -> Option<f64> {
     v.and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
-}
-fn price(v: f64) -> i32 {
-    (if v > 1.0 { v / 100.0 } else { v } * 10_000.0).round() as i32
 }
 fn dollar(v: i32) -> f64 {
     f64::from(v) / 10_000.0
@@ -900,14 +890,14 @@ fn canonical_team(value: &str) -> String {
         "tentitans" | "tennesseetitans" => "tennesseetitans",
         "wascommanders" | "washingtoncommanders" => "washingtoncommanders",
         "arizona" | "arizonadiamondbacks" => "arizonadiamondbacks",
-        "atlanta" | "atlantabraves" => "atlantabraves",
+        "atlanta" | "atlbraves" | "atlantabraves" => "atlantabraves",
         "as" | "athletics" | "oakland" | "oaklandathletics" => "athletics",
         "baltimore" | "baltimoreorioles" => "baltimoreorioles",
         "boston" | "bostonredsox" => "bostonredsox",
         "chicagoc" | "chicagocubs" => "chicagocubs",
-        "chicagows" | "chicagowhitesox" => "chicagowhitesox",
+        "chicagows" | "chiwhitesox" | "chicagowhitesox" => "chicagowhitesox",
         "cincinnati" | "cincinnatireds" => "cincinnatireds",
-        "cleveland" | "clevelandguardians" => "clevelandguardians",
+        "cleveland" | "cleguardians" | "clevelandguardians" => "clevelandguardians",
         "colorado" | "coloradorockies" => "coloradorockies",
         "detroit" | "detroittigers" => "detroittigers",
         "houston" | "houstonastros" => "houstonastros",
@@ -915,17 +905,17 @@ fn canonical_team(value: &str) -> String {
         "losangelesa" | "losangelesangels" => "losangelesangels",
         "losangelesd" | "losangelesdodgers" => "losangelesdodgers",
         "miami" | "miamimarlins" => "miamimarlins",
-        "milwaukee" | "milwaukeebrewers" => "milwaukeebrewers",
+        "milwaukee" | "milbrewers" | "milwaukeebrewers" => "milwaukeebrewers",
         "minnesota" | "minnesotatwins" => "minnesotatwins",
         "newyorkm" | "newyorkmets" => "newyorkmets",
-        "newyorky" | "newyorkyankees" => "newyorkyankees",
-        "philadelphia" | "philadelphiaphillies" => "philadelphiaphillies",
+        "newyorky" | "nyyankees" | "newyorkyankees" => "newyorkyankees",
+        "philadelphia" | "phiphillies" | "philadelphiaphillies" => "philadelphiaphillies",
         "pittsburgh" | "pittsburghpirates" => "pittsburghpirates",
-        "sandiego" | "sandiegopadres" => "sandiegopadres",
+        "sandiego" | "sdpadres" | "sandiegopadres" => "sandiegopadres",
         "sanfrancisco" | "sanfranciscogiants" => "sanfranciscogiants",
         "seattle" | "seattlemariners" => "seattlemariners",
         "stlouis" | "stlouiscardinals" => "stlouiscardinals",
-        "tampabay" | "tampabayrays" => "tampabayrays",
+        "tampabay" | "tbrays" | "tampabayrays" => "tampabayrays",
         "texas" | "texasrangers" => "texasrangers",
         "toronto" | "torontobluejays" => "torontobluejays",
         "washington" | "washingtonnationals" => "washingtonnationals",
@@ -956,8 +946,11 @@ fn similarity(a: &str, b: &str) -> f64 {
 }
 fn event_team_keys(value: &str) -> Option<[String; 2]> {
     let matchup = value
-        .strip_prefix("Game 1: ")
-        .or_else(|| value.strip_prefix("Game 2: "))
+        .strip_prefix("Game ")
+        .and_then(|rest| {
+            let (number, matchup) = rest.split_once(": ")?;
+            number.parse::<u8>().ok().map(|_| matchup)
+        })
         .unwrap_or(value);
     let teams: Vec<_> = matchup
         .split(':')
@@ -998,12 +991,21 @@ fn matchup_key(event: &Event, date: NaiveDate, sport: Sport) -> Option<String> {
     let [first, second] = event_team_keys(&event.title)?;
     let key = if is_esports(sport) {
         esports_team_key
+    } else if matches!(sport.label, "CBB" | "WCBB") {
+        college_team_key
     } else if is_tennis(sport) {
         tennis_player_key
     } else {
         canonical_team
     };
-    let mut teams = [key(&first), key(&second)];
+    let mut teams = if sport.label == "NBA" {
+        [
+            nba_team_key(&first)?.to_owned(),
+            nba_team_key(&second)?.to_owned(),
+        ]
+    } else {
+        [key(&first), key(&second)]
+    };
     if teams[0].is_empty() || teams[1].is_empty() || teams[0] == teams[1] {
         return None;
     }
@@ -1076,7 +1078,10 @@ fn same_scheduled_start_time(kalshi_event: &Event, poly_detail: &Value, sport: S
 }
 
 fn event_match_score(kalshi: &Event, polymarket: &Event, sport: Sport) -> f64 {
-    if matches!(sport.label, "NFL" | "CFB" | "MLB" | "ATP" | "WTA") {
+    if matches!(
+        sport.label,
+        "NFL" | "CFB" | "NBA" | "CBB" | "WCBB" | "MLB" | "ATP" | "WTA"
+    ) {
         let kalshi_date = kalshi_event_date(&kalshi.id);
         if kalshi_date.is_none() || kalshi_date != polymarket_event_date(&polymarket.id) {
             return 0.0;
@@ -1105,14 +1110,21 @@ fn event_match_score(kalshi: &Event, polymarket: &Event, sport: Sport) -> f64 {
             _ => 0.0,
         };
     }
-    if is_tennis(sport) {
+    if is_tennis(sport) || matches!(sport.label, "NBA" | "CBB" | "WCBB") {
+        let same = if sport.label == "NBA" {
+            same_nba_team
+        } else if matches!(sport.label, "CBB" | "WCBB") {
+            same_college_team
+        } else {
+            same_tennis_player
+        };
         return match (
             event_team_keys(&kalshi.title),
             event_team_keys(&polymarket.title),
         ) {
             (Some(a), Some(b))
-                if (same_tennis_player(&a[0], &b[0]) && same_tennis_player(&a[1], &b[1]))
-                    || (same_tennis_player(&a[0], &b[1]) && same_tennis_player(&a[1], &b[0])) =>
+                if (same(&a[0], &b[0]) && same(&a[1], &b[1]))
+                    || (same(&a[0], &b[1]) && same(&a[1], &b[0])) =>
             {
                 1.0
             }
@@ -1133,7 +1145,10 @@ struct EventMatcher<'a> {
 impl<'a> EventMatcher<'a> {
     fn new(events: &'a [Event], sport: Sport) -> Self {
         let mut by_date: HashMap<NaiveDate, Vec<&Event>> = HashMap::new();
-        if matches!(sport.label, "NFL" | "CFB" | "MLB" | "ATP" | "WTA") {
+        if matches!(
+            sport.label,
+            "NFL" | "CFB" | "NBA" | "CBB" | "WCBB" | "MLB" | "ATP" | "WTA"
+        ) {
             for event in events {
                 if let Some(date) = polymarket_event_date(&event.id) {
                     by_date.entry(date).or_default().push(event);
@@ -1161,7 +1176,10 @@ impl<'a> EventMatcher<'a> {
     }
 
     fn block_duplicate_matchups(&mut self, kalshi_games: &[Event]) {
-        if self.sport.label != "MLB" && !is_esports(self.sport) && !is_tennis(self.sport) {
+        if !matches!(self.sport.label, "MLB" | "NBA" | "CBB" | "WCBB")
+            && !is_esports(self.sport)
+            && !is_tennis(self.sport)
+        {
             return;
         }
         let mut counts = HashMap::new();
@@ -1198,7 +1216,9 @@ impl<'a> EventMatcher<'a> {
     }
 
     fn is_blocked(&self, event: &Event) -> bool {
-        (self.sport.label == "MLB" || is_esports(self.sport) || is_tennis(self.sport))
+        (matches!(self.sport.label, "MLB" | "NBA" | "CBB" | "WCBB")
+            || is_esports(self.sport)
+            || is_tennis(self.sport))
             && kalshi_event_date(&event.id)
                 .and_then(|date| matchup_key(event, date, self.sport))
                 .is_some_and(|key| self.blocked_matchups.contains(&key))
@@ -1208,7 +1228,10 @@ impl<'a> EventMatcher<'a> {
         if self.is_blocked(kalshi) {
             return None;
         }
-        let candidates = if matches!(self.sport.label, "NFL" | "CFB" | "MLB" | "ATP" | "WTA") {
+        let candidates = if matches!(
+            self.sport.label,
+            "NFL" | "CFB" | "NBA" | "CBB" | "WCBB" | "MLB" | "ATP" | "WTA"
+        ) {
             self.by_date
                 .get(&kalshi_event_date(&kalshi.id)?)?
                 .as_slice()
@@ -1276,11 +1299,30 @@ fn side_label(market: &Value, long: bool) -> Option<String> {
 }
 
 fn total_scope_matches(market: &Value, spec: TotalSeries) -> bool {
-    market["marketType"].as_str() == Some("totals")
-        && market["sportsMarketType"].as_str().is_some_and(|kind| {
-            let kind = normal(kind);
-            kind == spec.poly_type
-                || (spec.poly_type == "footballgametotal" && kind == "footballgamefullgametotal")
+    if market["marketType"].as_str() != Some("totals") {
+        return false;
+    }
+    let Some(kind) = market["sportsMarketType"].as_str().map(normal) else {
+        return false;
+    };
+    if kind == spec.poly_type
+        || (spec.poly_type == "footballgametotal" && kind == "footballgamefullgametotal")
+    {
+        return true;
+    }
+    // Polymarket currently labels whole-game NFL totals as "team" totals.
+    // The game-total slug and absence of a team on either side distinguish
+    // them from actual team-point totals.
+    spec.poly_type == "footballgametotal"
+        && kind == "footballteamfullgametotal"
+        && market["slug"]
+            .as_str()
+            .is_some_and(|slug| slug.contains("-total-"))
+        && market["marketSides"].as_array().is_some_and(|sides| {
+            sides.len() == 2
+                && sides
+                    .iter()
+                    .all(|side| side["team"].is_null() && side["teamId"].is_null())
         })
 }
 
@@ -1295,6 +1337,9 @@ fn prop_series(sport: Sport) -> &'static [PropSeries] {
 
 fn spread_series(sport: Sport) -> &'static [SpreadSeries] {
     match sport.label {
+        "NBA" => NBA_SPREAD_SERIES,
+        "CBB" => CBB_SPREAD_SERIES,
+        "WCBB" => WCBB_SPREAD_SERIES,
         "NFL" => NFL_SPREAD_SERIES,
         "CFB" => CFB_SPREAD_SERIES,
         "MLB" => MLB_SPREAD_SERIES,
@@ -1305,6 +1350,9 @@ fn spread_series(sport: Sport) -> &'static [SpreadSeries] {
 
 fn total_series(sport: Sport) -> &'static [TotalSeries] {
     match sport.label {
+        "NBA" => NBA_TOTAL_SERIES,
+        "CBB" => CBB_TOTAL_SERIES,
+        "WCBB" => WCBB_TOTAL_SERIES,
         "NFL" => NFL_TOTAL_SERIES,
         "CFB" => CFB_TOTAL_SERIES,
         "MLB" => MLB_TOTAL_SERIES,
@@ -1390,6 +1438,8 @@ fn spread_scope_matches(market: &Value, sport: Sport, spec: SpreadSeries) -> boo
         .unwrap_or_default();
     let expected = if is_tennis(sport) {
         "tennismatchgamesspread".to_owned()
+    } else if matches!(sport.label, "NBA" | "CBB" | "WCBB") {
+        "basketballteamfullgamespread".to_owned()
     } else if sport.label == "MLB" {
         if spec.period.is_empty() {
             "baseballteamfullgamespread".to_owned()
@@ -1499,6 +1549,7 @@ fn pair_props(kalshi: &Value, polymarket: &Value, sport: Sport, spec: PropSeries
                         .is_some_and(|label| label.to_lowercase().contains("under"))
             })?;
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: match spec.kind {
@@ -1515,6 +1566,7 @@ fn pair_props(kalshi: &Value, polymarket: &Value, sport: Sport, spec: PropSeries
                     format!("{entity} Under {line}"),
                 ],
                 poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first: true,
             })
         })
@@ -1616,6 +1668,7 @@ fn pair_mlb_props(kalshi: &Value, polymarket: &Value, sport: Sport, spec: PropSe
                 ],
             };
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: match spec.kind {
@@ -1627,6 +1680,7 @@ fn pair_mlb_props(kalshi: &Value, polymarket: &Value, sport: Sport, spec: PropSe
                 kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
                 teams,
                 poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first: true,
             })
         })
@@ -1698,12 +1752,14 @@ fn pair_esports_map_winners(kalshi: &Value, polymarket: &Value, sport: Sport) ->
             let (teams, tickers, poly_long_is_first) =
                 align_moneyline_with(kalshi_outcomes.clone(), [subject, other], same_esports_team)?;
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("{unit} {number} winner"),
                 kalshi: tickers,
                 teams,
                 poly_slug: market["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first,
             })
         })
@@ -1771,12 +1827,14 @@ fn pair_tennis_set_winners(kalshi: &Value, polymarket: &Value, sport: Sport) -> 
             let (teams, tickers, poly_long_is_first) =
                 align_moneyline_with(outcomes.clone(), [subject, other], same_tennis_player)?;
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("Set {number} winner"),
                 kalshi: tickers,
                 teams,
                 poly_slug: market["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first,
             })
         })
@@ -1838,12 +1896,14 @@ fn pair_tennis_exact_scores(kalshi: &Value, polymarket: &Value, sport: Sport) ->
             })?;
             let outcome = format!("{player} wins {}-{}", score.0, score.1);
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("Exact match score ({}-{})", score.0, score.1),
                 kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
                 teams: [outcome.clone(), format!("Not {outcome}")],
                 poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first: true,
             })
         })
@@ -1854,6 +1914,13 @@ fn pair_spreads(kalshi: &Value, polymarket: &Value, sport: Sport, spec: SpreadSe
     if is_tennis(sport) {
         return pair_tennis_game_spreads(kalshi, polymarket, sport, spec);
     }
+    let same = if sport.label == "NBA" {
+        same_nba_team
+    } else if matches!(sport.label, "CBB" | "WCBB") {
+        same_college_team
+    } else {
+        same_team
+    };
     let Some(poly_markets) = polymarket
         .pointer("/event/markets")
         .and_then(Value::as_array)
@@ -1892,8 +1959,8 @@ fn pair_spreads(kalshi: &Value, polymarket: &Value, sport: Sport, spec: SpreadSe
                 let short = market_team(poly, false);
                 match (long, short, number(poly.get("line"))) {
                     (Some(long), Some(short), Some(poly_line)) => {
-                        let matches_long = same_team(&kalshi_team, &long);
-                        let matches_short = same_team(&kalshi_team, &short);
+                        let matches_long = same(&kalshi_team, &long);
+                        let matches_short = same(&kalshi_team, &short);
                         matches_long != matches_short
                             && ((matches_long && (poly_line + line).abs() < 1e-9)
                                 || (matches_short && (poly_line - line).abs() < 1e-9))
@@ -1903,12 +1970,13 @@ fn pair_spreads(kalshi: &Value, polymarket: &Value, sport: Sport, spec: SpreadSe
             })?;
             let long = market_team(poly, true)?;
             let short = market_team(poly, false)?;
-            let opposite = if same_team(&kalshi_team, &long) {
+            let opposite = if same(&kalshi_team, &long) {
                 short
             } else {
                 long.clone()
             };
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("{} spread ({line:+})", spec.label),
@@ -1918,7 +1986,8 @@ fn pair_spreads(kalshi: &Value, polymarket: &Value, sport: Sport, spec: SpreadSe
                     format!("{opposite} +{line}"),
                 ],
                 poly_slug: poly["slug"].as_str()?.to_owned(),
-                poly_long_is_first: same_team(&kalshi_team, &long),
+                poly_url: String::new(),
+                poly_long_is_first: same(&kalshi_team, &long),
             })
         })
         .collect()
@@ -1985,12 +2054,14 @@ fn pair_tennis_game_spreads(
             let poly_long_is_first = same_tennis_player(player, &long);
             let opposite = if poly_long_is_first { short } else { long };
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("{} spread (-{line})", spec.label),
                 kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
                 teams: [format!("{player} -{line}"), format!("{opposite} +{line}")],
                 poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first,
             })
         })
@@ -2030,12 +2101,14 @@ fn pair_totals(kalshi: &Value, polymarket: &Value, sport: Sport, spec: TotalSeri
                         .is_some_and(|label| label.to_lowercase().contains("under"))
             })?;
             Some(Pair {
+                safety: [None, None],
                 sport: sport.label,
                 title: polymarket["event"]["title"].as_str()?.to_owned(),
                 market: format!("{} total ({line})", spec.label),
                 kalshi: [market["ticker"].as_str()?.to_owned(), String::new()],
                 teams: [format!("Over {line}"), format!("Under {line}")],
                 poly_slug: poly["slug"].as_str()?.to_owned(),
+                poly_url: String::new(),
                 poly_long_is_first: true,
             })
         })
@@ -2158,6 +2231,7 @@ fn kalshi_tennis_match_title(event: &Value) -> Option<String> {
 async fn kalshi_events(
     client: &Client,
     series: &str,
+    catalog: &mut HashMap<String, Value>,
 ) -> Result<KalshiSeriesEvents, Box<dyn Error>> {
     let mut all = KalshiSeriesEvents::default();
     let mut cursor: Option<String> = None;
@@ -2178,6 +2252,11 @@ async fn kalshi_events(
             .as_array()
             .ok_or("Kalshi events response missing events")?
         {
+            for market in event["markets"].as_array().into_iter().flatten() {
+                if let Some(ticker) = market["ticker"].as_str() {
+                    catalog.insert(ticker.to_owned(), market.clone());
+                }
+            }
             let (open_markets, two_way_moneyline) = kalshi_event_counts(event)?;
             all.open_markets += open_markets;
             all.two_way_moneylines += usize::from(two_way_moneyline);
@@ -2312,11 +2391,12 @@ async fn discover_props(
     matcher: &EventMatcher<'_>,
     polymarket_details: &HashMap<String, Value>,
     matched_event_ids: &mut HashSet<String>,
+    catalog: &mut HashMap<String, Value>,
 ) -> Result<(Vec<Pair>, usize), Box<dyn Error>> {
     let mut out = Vec::new();
     let mut open_markets = 0;
     for spec in prop_series(sport) {
-        let series = kalshi_events(client, spec.kalshi_series).await?;
+        let series = kalshi_events(client, spec.kalshi_series, catalog).await?;
         open_markets += series.open_markets;
         for kalshi_event in &series.events {
             let Some(poly_event) = matcher.best_match(kalshi_event) else {
@@ -2348,11 +2428,12 @@ async fn discover_esports_maps(
     matcher: &EventMatcher<'_>,
     polymarket_details: &HashMap<String, Value>,
     matched_event_ids: &mut HashSet<String>,
+    catalog: &mut HashMap<String, Value>,
 ) -> Result<(Vec<Pair>, usize), Box<dyn Error>> {
     let Some((series_ticker, _, _)) = esports_map_series(sport) else {
         return Ok((Vec::new(), 0));
     };
-    let series = kalshi_events(client, series_ticker).await?;
+    let series = kalshi_events(client, series_ticker, catalog).await?;
     let mut out = Vec::new();
     for kalshi_event in &series.events {
         let Some(poly_event) = matcher.best_match(kalshi_event) else {
@@ -2383,11 +2464,12 @@ async fn discover_tennis_props(
     matcher: &EventMatcher<'_>,
     polymarket_details: &HashMap<String, Value>,
     matched_event_ids: &mut HashSet<String>,
+    catalog: &mut HashMap<String, Value>,
 ) -> Result<(Vec<Pair>, usize), Box<dyn Error>> {
     let mut out = Vec::new();
     let mut open_markets = 0;
     for &(series_ticker, kind) in tennis_prop_series(sport) {
-        let series = kalshi_events(client, series_ticker).await?;
+        let series = kalshi_events(client, series_ticker, catalog).await?;
         open_markets += series.open_markets;
         for kalshi_event in &series.events {
             let Some(poly_event) = matcher.best_match(kalshi_event) else {
@@ -2423,11 +2505,12 @@ async fn discover_spreads(
     matcher: &EventMatcher<'_>,
     polymarket_details: &HashMap<String, Value>,
     matched_event_ids: &mut HashSet<String>,
+    catalog: &mut HashMap<String, Value>,
 ) -> Result<(Vec<Pair>, usize), Box<dyn Error>> {
     let mut out = Vec::new();
     let mut open_markets = 0;
     for spec in spread_series(sport) {
-        let series = kalshi_events(client, spec.kalshi_series).await?;
+        let series = kalshi_events(client, spec.kalshi_series, catalog).await?;
         open_markets += series.open_markets;
         for kalshi_event in &series.events {
             let Some(poly_event) = matcher.best_match(kalshi_event) else {
@@ -2454,8 +2537,9 @@ async fn discover_spreads(
 }
 
 async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Error>> {
+    let mut catalog = HashMap::new();
     let (k, p) = tokio::join!(
-        kalshi_events(client, sport.kalshi_series),
+        kalshi_events(client, sport.kalshi_series, &mut catalog),
         polymarket_events(client, sport.polymarket_league)
     );
     let k = k?;
@@ -2547,6 +2631,10 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         let ps = [long, short];
         let aligned = if is_esports(sport) {
             align_moneyline_with(km, ps, same_esports_team)
+        } else if matches!(sport.label, "CBB" | "WCBB") {
+            align_moneyline_with(km, ps, same_college_team)
+        } else if sport.label == "NBA" {
+            align_moneyline_with(km, ps, same_nba_team)
         } else if is_tennis(sport) {
             align_moneyline_with(km, ps, same_tennis_player)
         } else {
@@ -2556,6 +2644,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
             continue;
         };
         out.push(Pair {
+            safety: [None, None],
             sport: sport.label,
             title: p.title,
             market: if is_esports(sport) {
@@ -2566,6 +2655,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
             kalshi: tickers,
             teams,
             poly_slug: slug.into(),
+            poly_url: String::new(),
             poly_long_is_first,
         });
         matched_event_ids.insert(p.id);
@@ -2579,6 +2669,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         &matcher,
         &poly_details,
         &mut matched_event_ids,
+        &mut catalog,
     )
     .await?;
     kalshi_counts.spreads = kalshi_spreads;
@@ -2587,7 +2678,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
 
     let before_totals = out.len();
     for spec in total_series(sport) {
-        let series = kalshi_events(client, spec.kalshi_series).await?;
+        let series = kalshi_events(client, spec.kalshi_series, &mut catalog).await?;
         kalshi_counts.totals += series.open_markets;
         for kalshi_event in &series.events {
             let Some(poly_event) = matcher.best_match(kalshi_event) else {
@@ -2617,6 +2708,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         &matcher,
         &poly_details,
         &mut matched_event_ids,
+        &mut catalog,
     )
     .await?;
     kalshi_counts.props += map_markets;
@@ -2628,6 +2720,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         &matcher,
         &poly_details,
         &mut matched_event_ids,
+        &mut catalog,
     )
     .await?;
     kalshi_counts.props += kalshi_props;
@@ -2639,38 +2732,28 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         &matcher,
         &poly_details,
         &mut matched_event_ids,
+        &mut catalog,
     )
     .await?;
     kalshi_counts.props += kalshi_tennis_props;
     prop_pairs += tennis_props.len();
     out.extend(tennis_props);
-    let mut novig_counts = None;
-    let novig_pairs = if novig::enabled()? {
-        match discover_novig(client, &out).await {
-            Ok(result) => {
-                novig_counts = Some(MarketCounts {
-                    games: result.games,
-                    moneylines: result.moneylines,
-                    spreads: result.spreads,
-                    totals: result.totals,
-                    props: result.props,
-                });
-                result.matches
-            }
-            Err(error) => {
-                eprintln!(
-                    "{}: Novig discovery unavailable ({error}); continuing Kalshi/Polymarket scan.",
-                    sport.label
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let kalshi_polymarket_pairs = out.len();
+    attach_polymarket_urls(&mut out, &poly_details);
+    prepare_pair_safety(client, sport, &mut out, &catalog, &poly_details).await?;
     let batch_count = subscription_batches(&out).len();
+    let matched_games = matched_event_ids
+        .iter()
+        .filter_map(|id| {
+            let event = polymarket_events_for_derivatives
+                .iter()
+                .find(|event| &event.id == id)?;
+            let date = polymarket_event_date(id)?;
+            Some(matchup_key(event, date, sport).unwrap_or_else(|| format!("polymarket:{id}")))
+        })
+        .collect::<HashSet<_>>();
     let matched_counts = MarketCounts {
-        games: matched_event_ids.len(),
+        games: matched_games.len(),
         moneylines: moneyline_pairs,
         spreads: spread_pairs,
         totals: total_pairs,
@@ -2679,7 +2762,7 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
     let summary = format!(
         "\n{} discovery\n\
          {:13}{:>7}{:>13}{:>10}{:>9}{:>8}\n\
-         {}\n{}\n{}\n{}\n\n\
+         {}\n{}\n{}\n\n\
          Market pairs: {}\n\
          Subscription batches: {batch_count}",
         sport.label,
@@ -2689,21 +2772,17 @@ async fn discover(client: &Client, sport: Sport) -> Result<Discovery, Box<dyn Er
         "Spreads",
         "Totals",
         "Props",
-        discovery_row("Kalshi", Some(&kalshi_counts)),
-        discovery_row("Polymarket", Some(&polymarket_counts)),
-        discovery_row("Novig", novig_counts.as_ref()),
-        discovery_row("Matched", Some(&matched_counts)),
-        out.len(),
+        discovery_row("Kalshi", &kalshi_counts),
+        discovery_row("Polymarket", &polymarket_counts),
+        discovery_row("Matched", &matched_counts),
+        kalshi_polymarket_pairs,
     );
     if io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none() {
         println!("\x1b[2m{summary}\x1b[0m\n");
     } else {
         println!("{summary}\n");
     }
-    Ok(Discovery {
-        pairs: out,
-        novig_pairs,
-    })
+    Ok(Discovery { pairs: out })
 }
 
 fn now() -> Result<String, Box<dyn Error>> {
@@ -2830,104 +2909,29 @@ fn request(
     Ok(r)
 }
 
-fn set_levels(target: &mut BTreeMap<i32, f64>, levels: &[Value]) {
-    target.clear();
-    for level in levels {
-        let p = number(level.get(0).or_else(|| level.pointer("/px/value")));
-        let q = number(level.get(1).or_else(|| level.get("qty")));
-        if let (Some(p), Some(q)) = (p, q) {
-            if q > 0.0 {
-                target.insert(price(p), q);
-            }
-        }
-    }
-}
-fn k_snapshot<'a>(payload: &'a Value, books: &mut HashMap<String, KalshiBook>) -> Option<&'a str> {
-    let Some(t) = payload
-        .pointer("/msg/market_ticker")
-        .and_then(Value::as_str)
-    else {
-        return None;
-    };
-    let levels = payload
-        .pointer("/msg/no_dollars_fp")
-        .and_then(Value::as_array)?;
-    let book = books.get_mut(t)?;
-    set_levels(&mut book.no, levels);
-    book.updated = Some(Instant::now());
-    book.generation += 1;
-    Some(t)
-}
-fn k_delta<'a>(payload: &'a Value, books: &mut HashMap<String, KalshiBook>) -> Option<&'a str> {
-    let msg = &payload["msg"];
-    let (Some(t), Some(p), Some(d), Some(side)) = (
-        msg["market_ticker"].as_str(),
-        number(msg.get("price_dollars")),
-        number(msg.get("delta_fp")),
-        msg["side"].as_str(),
-    ) else {
-        return None;
-    };
-    if side != "no" {
-        return None;
-    };
-    let book = books.get_mut(t)?;
-    let key = price(p);
-    if book.updated.is_none() {
-        return None;
-    }
-    let next = book.no.get(&key).copied().unwrap_or(0.0) + d;
-    if next <= 0.0 {
-        book.no.remove(&key);
-    } else {
-        book.no.insert(key, next);
-    }
-    book.updated = Some(Instant::now());
-    book.generation += 1;
-    Some(t)
-}
-fn p_book<'a>(payload: &'a Value, books: &mut HashMap<String, PolyBook>) -> Option<&'a str> {
-    let Some(data) = payload.get("marketData") else {
-        return None;
-    };
-    let Some(slug) = data["marketSlug"].as_str() else {
-        return None;
-    };
-    let bids = data.get("bids").and_then(Value::as_array)?;
-    let offers = data.get("offers").and_then(Value::as_array)?;
-    let book = books.get_mut(slug)?;
-    set_levels(&mut book.bids, bids);
-    set_levels(&mut book.offers, offers);
-    book.updated = Some(Instant::now());
-    book.generation += 1;
-    Some(slug)
-}
-
+#[cfg(test)]
 fn kalshi_taker_fee(price: f64, contracts: u64) -> f64 {
-    // Kalshi rounds its market-order fee up to a centicent ($0.0001).
-    (KALSHI_TAKER_FEE_RATE * contracts as f64 * price * (1.0 - price) * 10_000.0).ceil() / 10_000.0
+    let m = default_kalshi_fee();
+    m.rounded(price * contracts as f64, m.exact(price, contracts))
 }
-
-fn bankers_round_to_cents(value: f64) -> f64 {
-    let cents = value * 100.0;
-    let lower = cents.floor();
-    let fraction = cents - lower;
-    let rounded = if (fraction - 0.5).abs() < 1e-9 {
-        if (lower as i64).rem_euclid(2) == 0 {
-            lower
-        } else {
-            lower + 1.0
-        }
-    } else {
-        cents.round()
-    };
-    rounded / 100.0
-}
-
+#[cfg(test)]
 fn polymarket_us_taker_fee(price: f64, contracts: u64) -> f64 {
-    bankers_round_to_cents(POLYMARKET_US_TAKER_FEE_RATE * contracts as f64 * price * (1.0 - price))
+    let m = default_poly_fee();
+    m.rounded(price * contracts as f64, m.exact(price, contracts))
+}
+#[cfg(test)]
+fn default_kalshi_fee() -> FeeModel {
+    FeeModel::KalshiQuadratic {
+        coefficient: 0.07,
+        balance_precision: 0.01,
+    }
+}
+#[cfg(test)]
+fn default_poly_fee() -> FeeModel {
+    FeeModel::PolymarketStandard { coefficient: 0.095 }
 }
 
+#[cfg(test)]
 fn kalshi_yes_fill(book: &KalshiBook, target: u64) -> Fill {
     let mut fill = Fill {
         contracts: 0,
@@ -2935,6 +2939,8 @@ fn kalshi_yes_fill(book: &KalshiBook, target: u64) -> Fill {
         fee: 0.0,
         levels: 0,
     };
+    let model = default_kalshi_fee();
+    let mut exact_fee = 0.0;
     for (&no_bid, &available) in book.no.iter().rev() {
         let quantity = (available.floor() as u64).min(target - fill.contracts);
         if quantity == 0 {
@@ -2943,7 +2949,8 @@ fn kalshi_yes_fill(book: &KalshiBook, target: u64) -> Fill {
         let price = 1.0 - dollar(no_bid);
         fill.contracts += quantity;
         fill.cost += price * quantity as f64;
-        fill.fee += kalshi_taker_fee(price, quantity);
+        exact_fee += model.exact(price, quantity);
+        fill.fee = model.rounded(fill.cost, exact_fee);
         fill.levels += 1;
         if fill.contracts == target {
             break;
@@ -2952,6 +2959,7 @@ fn kalshi_yes_fill(book: &KalshiBook, target: u64) -> Fill {
     fill
 }
 
+#[cfg(test)]
 fn polymarket_fill_levels<'a>(
     levels: impl Iterator<Item = (&'a i32, &'a f64)>,
     buy_long: bool,
@@ -2963,6 +2971,8 @@ fn polymarket_fill_levels<'a>(
         fee: 0.0,
         levels: 0,
     };
+    let model = default_poly_fee();
+    let mut exact_fee = 0.0;
     for (&book_price, &available) in levels {
         let quantity = (available.floor() as u64).min(target - fill.contracts);
         if quantity == 0 {
@@ -2975,7 +2985,8 @@ fn polymarket_fill_levels<'a>(
         };
         fill.contracts += quantity;
         fill.cost += price * quantity as f64;
-        fill.fee += polymarket_us_taker_fee(price, quantity);
+        exact_fee += model.exact(price, quantity);
+        fill.fee = model.rounded(fill.cost, exact_fee);
         fill.levels += 1;
         if fill.contracts == target {
             break;
@@ -2984,12 +2995,153 @@ fn polymarket_fill_levels<'a>(
     fill
 }
 
+#[cfg(test)]
 fn polymarket_fill(book: &PolyBook, buy_long: bool, target: u64) -> Fill {
     if buy_long {
         polymarket_fill_levels(book.offers.iter(), true, target)
     } else {
         polymarket_fill_levels(book.bids.iter().rev(), false, target)
     }
+}
+
+// Price levels in execution order, with whole contracts available at each price.
+type AskLevels = Vec<(f64, u64)>;
+
+fn executable_levels(k: &KalshiBook, p: &PolyBook, buy_long: bool) -> (AskLevels, AskLevels) {
+    let kalshi =
+        k.no.iter()
+            .rev()
+            .map(|(&price, &qty)| (1.0 - dollar(price), qty.floor() as u64))
+            .filter(|&(_, qty)| qty > 0)
+            .collect();
+    let poly: AskLevels = if buy_long {
+        p.offers
+            .iter()
+            .map(|(&price, &qty)| (dollar(price), qty.floor() as u64))
+            .collect()
+    } else {
+        p.bids
+            .iter()
+            .rev()
+            .map(|(&price, &qty)| (1.0 - dollar(price), qty.floor() as u64))
+            .collect()
+    };
+    (
+        kalshi,
+        poly.into_iter().filter(|&(_, qty)| qty > 0).collect(),
+    )
+}
+
+fn visible_contracts(levels: &[(f64, u64)]) -> u64 {
+    levels
+        .iter()
+        .fold(0u64, |total, &(_, qty)| total.saturating_add(qty))
+}
+
+struct FillCursor<'a> {
+    levels: &'a [(f64, u64)],
+    index: usize,
+    taken: u64,
+    completed: Fill,
+    fee: FeeModel,
+    completed_exact_fee: f64,
+}
+
+impl<'a> FillCursor<'a> {
+    fn new(levels: &'a [(f64, u64)], fee: FeeModel) -> Self {
+        Self {
+            levels,
+            index: 0,
+            taken: 0,
+            completed: Fill {
+                contracts: 0,
+                cost: 0.0,
+                fee: 0.0,
+                levels: 0,
+            },
+            fee,
+            completed_exact_fee: 0.0,
+        }
+    }
+
+    fn next_price(&self) -> Option<f64> {
+        self.levels.get(self.index).map(|&(price, _)| price)
+    }
+
+    fn advance(&mut self) -> Fill {
+        let (price, available) = self.levels[self.index];
+        self.taken += 1;
+        let fill = Fill {
+            contracts: self.completed.contracts + self.taken,
+            cost: self.completed.cost + price * self.taken as f64,
+            // Polymarket caps taker rounding across the whole order; Kalshi's
+            // accumulator also carries across fills. Never reset at a level.
+            fee: self.fee.rounded(
+                self.completed.cost + price * self.taken as f64,
+                self.completed_exact_fee + self.fee.exact(price, self.taken),
+            ),
+            levels: self.completed.levels + 1,
+        };
+        if self.taken == available {
+            self.completed_exact_fee += self.fee.exact(price, self.taken);
+            self.completed = fill.clone();
+            self.taken = 0;
+            self.index += 1;
+        }
+        fill
+    }
+}
+
+#[cfg(test)]
+fn optimal_matched_fills(kalshi: &[(f64, u64)], poly: &[(f64, u64)]) -> Option<(Fill, Fill)> {
+    optimal_matched_fills_with_fees(kalshi, poly, default_kalshi_fee(), default_poly_fee())
+}
+
+fn optimal_matched_fills_with_fees(
+    kalshi: &[(f64, u64)],
+    poly: &[(f64, u64)],
+    kalshi_fee: FeeModel,
+    poly_fee: FeeModel,
+) -> Option<(Fill, Fill)> {
+    let mut k = FillCursor::new(kalshi, kalshi_fee);
+    let mut p = FillCursor::new(poly, poly_fee);
+    let mut best = None;
+    let mut best_net = 0.0;
+    while k.next_price().is_some() && p.next_price().is_some() {
+        // Fee accumulators can return rounding overpayments. Keep checking
+        // past a zero gross marginal edge until even an optimistic rounding
+        // bound cannot beat the best size.
+        let k_fill = k.advance();
+        let p_fill = p.advance();
+        let net = k_fill.contracts as f64 - k_fill.cost - p_fill.cost - k_fill.fee - p_fill.fee;
+        // Keep the smaller size when profits tie. Do not stop at the first
+        // fee-induced loss: rounding can make later sizes more profitable.
+        if net > best_net + 1e-9 {
+            best_net = net;
+            best = Some((k_fill.clone(), p_fill.clone()));
+        }
+        let exact_fee = |cursor: &FillCursor<'_>| {
+            cursor.completed_exact_fee
+                + if cursor.taken > 0 {
+                    cursor
+                        .fee
+                        .exact(cursor.levels[cursor.index].0, cursor.taken)
+                } else {
+                    0.0
+                }
+        };
+        let optimistic =
+            k_fill.contracts as f64 - k_fill.cost - p_fill.cost - exact_fee(&k) - exact_fee(&p)
+                + 0.005;
+        if k.next_price()
+            .zip(p.next_price())
+            .is_some_and(|(kp, pp)| kp + pp >= 1.0)
+            && optimistic <= best_net + 1e-9
+        {
+            break;
+        }
+    }
+    best
 }
 
 async fn candidate<'a>(
@@ -2999,7 +3151,7 @@ async fn candidate<'a>(
     pb: &HashMap<String, PolyBook>,
     pending: &mut HashMap<(&'a str, &'a str), Observation>,
     emitted: &mut HashMap<(&'a str, &'a str), Observation>,
-    reporter: &mpsc::Sender<ReportRecord>,
+    reporter: &mpsc::Sender<CandidateRecord>,
 ) -> Result<(), Box<dyn Error>> {
     for &index in indices {
         let pair = &pairs[index];
@@ -3007,37 +3159,41 @@ async fn candidate<'a>(
             continue;
         };
         if poly.updated.is_none_or(|t| t.elapsed() > MAX_AGE) {
+            pending.retain(|(slug, _), _| *slug != pair.poly_slug);
             continue;
         };
         for i in 0..2 {
+            let key = (pair.poly_slug.as_str(), pair.kalshi[i].as_str());
+            let Some(safety) = pair.safety[i].as_ref().filter(|s| s.eligible(Utc::now())) else {
+                continue;
+            };
+            let fees = safety.fees.as_ref().expect("eligible fees");
             let Some(k) = kb.get(&pair.kalshi[i]) else {
+                pending.remove(&key);
                 continue;
             };
             if k.updated.is_none_or(|t| t.elapsed() > MAX_AGE) {
+                pending.remove(&key);
                 continue;
             };
             if k.no.is_empty() {
+                pending.remove(&key);
                 continue;
             }
             let opposite_is_long = (1 - i == 0) == pair.poly_long_is_first;
-            let kalshi_initial = kalshi_yes_fill(k, MAX_SIMULATED_CONTRACTS);
-            let polymarket_initial =
-                polymarket_fill(poly, opposite_is_long, MAX_SIMULATED_CONTRACTS);
-            let contracts = kalshi_initial.contracts.min(polymarket_initial.contracts);
-            if contracts == 0 {
+            let (kalshi_levels, polymarket_levels) = executable_levels(k, poly, opposite_is_long);
+            let kalshi_available = visible_contracts(&kalshi_levels);
+            let polymarket_available = visible_contracts(&polymarket_levels);
+            let Some((kalshi_fill, polymarket_fill)) = optimal_matched_fills_with_fees(
+                &kalshi_levels,
+                &polymarket_levels,
+                fees.kalshi,
+                fees.polymarket,
+            ) else {
+                pending.remove(&key);
                 continue;
-            }
-            let kalshi_fill = if kalshi_initial.contracts == contracts {
-                kalshi_initial
-            } else {
-                kalshi_yes_fill(k, contracts)
             };
-            let polymarket_fill = if polymarket_initial.contracts == contracts {
-                polymarket_initial
-            } else {
-                polymarket_fill(poly, opposite_is_long, contracts)
-            };
-            let key = (pair.poly_slug.as_str(), pair.kalshi[i].as_str());
+            let contracts = kalshi_fill.contracts;
             let gross_profit = contracts as f64 - kalshi_fill.cost - polymarket_fill.cost;
             let net_profit = gross_profit - kalshi_fill.fee - polymarket_fill.fee;
             let observation = Observation {
@@ -3057,140 +3213,32 @@ async fn candidate<'a>(
                 if emitted.get(&key).copied() == Some(observation) {
                     continue;
                 }
-                let permit = reporter
-                    .reserve()
-                    .await
-                    .map_err(|_| "candidate reporter stopped")?;
+                let permit = match reporter.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err("candidate reporter stopped".into());
+                    }
+                };
+                if !safety.eligible(Utc::now()) {
+                    continue;
+                }
                 emitted.insert(key, observation);
                 pending.insert(key, observation);
-                permit.send(ReportRecord::KalshiPolymarket(CandidateRecord {
+                permit.send(CandidateRecord {
                     timestamp: clock(),
                     pair: pair.clone(),
                     kalshi_side: i,
+                    kalshi_available,
+                    polymarket_available,
                     kalshi_fill,
                     polymarket_fill,
                     contracts,
                     gross_profit,
                     net_profit,
-                }));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn novig_candidates(
-    pair_index: usize,
-    pairs: &[Pair],
-    novig_pairs: &[NovigPair],
-    kb: &HashMap<String, KalshiBook>,
-    pb: &HashMap<String, PolyBook>,
-    nb: &HashMap<String, novig::Book>,
-    pending: &mut HashMap<(usize, &'static str, usize), (u64, u64)>,
-    emitted: &mut HashMap<(usize, &'static str, usize), (u64, u64)>,
-    reporter: &mpsc::Sender<ReportRecord>,
-) -> Result<(), Box<dyn Error>> {
-    let pair = &pairs[pair_index];
-    for entry in novig_pairs
-        .iter()
-        .filter(|entry| entry.pair_index == pair_index)
-    {
-        let Some(book) = nb.get(&entry.market.id) else {
-            continue;
-        };
-        if book.updated.is_none_or(|time| time.elapsed() > MAX_AGE) {
-            continue;
-        }
-        for i in 0..2 {
-            let opposite_novig_id = &entry.market.outcomes[entry.aligned[i]].0;
-            let (novig_qty, _, _, _) = book.fill(
-                opposite_novig_id,
-                MAX_SIMULATED_CONTRACTS,
-                entry.market.fee_coefficient,
-            );
-            for venue in ["Kalshi", "Polymarket"] {
-                let (other_fill, other_generation) = if venue == "Kalshi" {
-                    let Some(k) = kb.get(&pair.kalshi[i]) else {
-                        continue;
-                    };
-                    if k.updated.is_none_or(|time| time.elapsed() > MAX_AGE) {
-                        continue;
-                    }
-                    (kalshi_yes_fill(k, MAX_SIMULATED_CONTRACTS), k.generation)
-                } else {
-                    let Some(p) = pb.get(&pair.poly_slug) else {
-                        continue;
-                    };
-                    if p.updated.is_none_or(|time| time.elapsed() > MAX_AGE) {
-                        continue;
-                    }
-                    let buy_long = (i == 0) == pair.poly_long_is_first;
-                    (
-                        polymarket_fill(p, buy_long, MAX_SIMULATED_CONTRACTS),
-                        p.generation,
-                    )
-                };
-                let contracts = other_fill.contracts.min(novig_qty / 100);
-                if contracts == 0 {
-                    continue;
-                }
-                let other_fill = if other_fill.contracts == contracts {
-                    other_fill
-                } else if venue == "Kalshi" {
-                    kalshi_yes_fill(&kb[&pair.kalshi[i]], contracts)
-                } else {
-                    polymarket_fill(
-                        &pb[&pair.poly_slug],
-                        (i == 0) == pair.poly_long_is_first,
-                        contracts,
-                    )
-                };
-                let (qty, cost, fee, levels) =
-                    book.fill(opposite_novig_id, contracts, entry.market.fee_coefficient);
-                if qty != contracts * 100 {
-                    continue;
-                }
-                let novig_fill = Fill {
-                    contracts,
-                    cost,
-                    fee,
-                    levels,
-                };
-                let gross_profit = contracts as f64 - other_fill.cost - novig_fill.cost;
-                let net_profit = gross_profit - other_fill.fee - novig_fill.fee;
-                if net_profit < MIN_NET_PROFIT_DOLLARS {
-                    continue;
-                }
-                let key = (pair_index, venue, i);
-                let generation = (other_generation, book.generation);
-                let Some(previous) = pending.get(&key).copied() else {
-                    pending.insert(key, generation);
-                    continue;
-                };
-                if generation.0 <= previous.0
-                    || generation.1 <= previous.1
-                    || emitted.get(&key).copied() == Some(generation)
-                {
-                    continue;
-                }
-                let permit = reporter
-                    .reserve()
-                    .await
-                    .map_err(|_| "candidate reporter stopped")?;
-                pending.insert(key, generation);
-                emitted.insert(key, generation);
-                permit.send(ReportRecord::Novig(NovigRecord {
-                    timestamp: clock(),
-                    pair: pair.clone(),
-                    other_venue: venue,
-                    other_outcome: pair.teams[i].clone(),
-                    other_fill,
-                    novig_outcome: pair.teams[1 - i].clone(),
-                    novig_fill,
-                    contracts,
-                    gross_profit,
-                    net_profit,
-                }));
+                });
+            } else {
+                pending.remove(&key);
             }
         }
     }
@@ -3198,53 +3246,19 @@ async fn novig_candidates(
 }
 
 async fn report_candidates(
-    mut receiver: mpsc::Receiver<ReportRecord>,
+    mut receiver: mpsc::Receiver<CandidateRecord>,
     client: Client,
     mut file: std::fs::File,
 ) -> std::io::Result<()> {
     while let Some(record) = receiver.recv().await {
-        let ReportRecord::KalshiPolymarket(record) = record else {
-            let ReportRecord::Novig(record) = record else {
-                unreachable!()
-            };
-            let balances = balance_snapshot(&client).await;
-            let other_average = record.other_fill.cost / record.contracts as f64;
-            let novig_average = record.novig_fill.cost / record.contracts as f64;
-            let line = json!({"kind":"confirmed_net_candidate","sport":record.pair.sport,"event":record.pair.title,"market":record.pair.market,"venue_a":record.other_venue,"venue_a_outcome":record.other_outcome,"venue_a_average_price":other_average,"venue_a_fee":record.other_fill.fee,"venue_a_levels":record.other_fill.levels,"venue_b":"Novig","venue_b_outcome":record.novig_outcome,"venue_b_average_price":novig_average,"venue_b_fee":record.novig_fill.fee,"venue_b_levels":record.novig_fill.levels,"contracts":record.contracts,"gross_profit":record.gross_profit,"net_profit":record.net_profit,"execution":{"status":"not_executed","mode":"dry_run"},"current_balances":&balances,"note":"Novig fee conservatively charged at the market rate regardless of event liveness; settlement-rule parity and fill risk remain unverified"});
-            writeln!(
-                file,
-                "{}",
-                serde_json::to_string(&line).map_err(std::io::Error::other)?
-            )?;
-            println!(
-                "---\n\n[{}] {}\nMarket: {}\nNet: +${:.2} on {} contracts\n\n{}\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\nNovig\n    {} @ ${:.4}\n    Fee: ${:.4} | Levels: {}\n\nExecution\n    Mode: Dry run\n\nBalances\n    Kalshi:       {}\n    Polymarket:  {}\n    Buying power: {}\n    Novig:        unavailable\n\n---\n",
-                record.timestamp,
-                record.pair.title,
-                record.pair.market,
-                record.net_profit,
-                record.contracts,
-                record.other_venue,
-                record.other_outcome,
-                other_average,
-                record.other_fill.fee,
-                record.other_fill.levels,
-                record.novig_outcome,
-                novig_average,
-                record.novig_fill.fee,
-                record.novig_fill.levels,
-                balances.kalshi,
-                balances.polymarket,
-                balances.buying_power
-            );
-            continue;
-        };
         let balances = balance_snapshot(&client).await;
         let pair = &record.pair;
         let kalshi_outcome = &pair.teams[record.kalshi_side];
         let polymarket_outcome = &pair.teams[1 - record.kalshi_side];
+        let kalshi_url = kalshi_market_url(&pair.kalshi[record.kalshi_side]);
         let kalshi_average = record.kalshi_fill.cost / record.contracts as f64;
         let polymarket_average = record.polymarket_fill.cost / record.contracts as f64;
-        let line = json!({"kind":"confirmed_net_candidate","sport":pair.sport,"event":pair.title,"market":pair.market,"kalshi_outcome":kalshi_outcome,"kalshi_average_price":kalshi_average,"kalshi_fee":record.kalshi_fill.fee,"kalshi_levels":record.kalshi_fill.levels,"polymarket_outcome":polymarket_outcome,"polymarket_average_price":polymarket_average,"polymarket_fee":record.polymarket_fill.fee,"polymarket_levels":record.polymarket_fill.levels,"contracts":record.contracts,"gross_profit":record.gross_profit,"net_profit":record.net_profit,"execution":{"status":"not_executed","mode":"dry_run"},"current_balances":&balances,"note":"dry run only; settlement-rule parity and fill risk remain unverified"});
+        let line = json!({"kind":"confirmed_net_candidate","sport":pair.sport,"event":pair.title,"market":pair.market,"kalshi_url":kalshi_url,"polymarket_url":pair.poly_url,"kalshi_ticker":pair.kalshi[record.kalshi_side],"polymarket_market_slug":pair.poly_slug,"kalshi_outcome":kalshi_outcome,"kalshi_average_price":kalshi_average,"kalshi_fee":record.kalshi_fill.fee,"kalshi_levels":record.kalshi_fill.levels,"kalshi_available_contracts":record.kalshi_available,"kalshi_required_capital":record.kalshi_fill.cost + record.kalshi_fill.fee,"polymarket_outcome":polymarket_outcome,"polymarket_average_price":polymarket_average,"polymarket_fee":record.polymarket_fill.fee,"polymarket_levels":record.polymarket_fill.levels,"polymarket_available_contracts":record.polymarket_available,"polymarket_required_capital":record.polymarket_fill.cost + record.polymarket_fill.fee,"sizing":"max_net_profit_visible_depth","balance_constrained":false,"contracts":record.contracts,"gross_profit":record.gross_profit,"net_profit":record.net_profit,"execution":{"status":"not_executed","mode":"dry_run"},"current_balances":&balances,"fees":pair.safety[record.kalshi_side].as_ref().and_then(|s| s.fees.as_ref()),"settlement_review":pair.safety[record.kalshi_side].as_ref().map(|s| json!({"fingerprint":s.rules.fingerprint,"decision":s.decision})),"note":"dry run only; settlement review is operator supplied, fees are L2 estimates, and fills are not guaranteed"});
         writeln!(
             file,
             "{}",
@@ -3259,12 +3273,16 @@ async fn report_candidates(
                 record.net_profit,
                 record.contracts,
                 DisplaySide {
+                    url: &kalshi_url,
+                    available: record.kalshi_available,
                     outcome: kalshi_outcome,
                     average_price: kalshi_average,
                     fee: record.kalshi_fill.fee,
                     levels: record.kalshi_fill.levels,
                 },
                 DisplaySide {
+                    url: &pair.poly_url,
+                    available: record.polymarket_available,
                     outcome: polymarket_outcome,
                     average_price: polymarket_average,
                     fee: record.polymarket_fill.fee,
@@ -3282,83 +3300,298 @@ mod tests {
     use super::*;
 
     #[test]
-    fn novig_moneyline_names_align_with_full_venue_names() {
-        assert!(novig_same_outcome("NFL", "ARI Cardinals", "ARI"));
-        assert!(novig_same_outcome("NFL", "NY Giants", "NYG"));
-        assert!(!novig_same_outcome("NFL", "NY Jets", "NYG"));
-        assert!(novig_same_outcome("ATP", "Daniil Medvedev", "D. Medvedev"));
-        assert!(novig_same_outcome(
-            "ATP",
-            "Alejandro Davidovich Fokina",
-            "A. Davidovich Fokina"
-        ));
-        assert!(!novig_same_outcome("ATP", "Andrey Rublev", "D. Medvedev"));
+    fn college_live_formats_match_both_leagues_and_full_game_lines() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/college_basketball_markets.json"
+        ))
+        .unwrap();
+        for league in ["cbb", "wcbb"] {
+            let fixture = &fixtures[league];
+            let sport = selected_sports(league).unwrap()[0];
+            let game = &fixture["kalshi"];
+            let detail = &fixture["polymarket"];
+            let kalshi = Event {
+                id: game["event_ticker"].as_str().unwrap().into(),
+                title: game["title"].as_str().unwrap().into(),
+            };
+            let poly = Event {
+                id: detail["event"]["slug"].as_str().unwrap().into(),
+                title: detail["event"]["title"].as_str().unwrap().into(),
+            };
+            assert_eq!(event_match_score(&kalshi, &poly, sport), 1.0, "{league}");
+            let outcomes = game["markets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        kalshi_winner(m["title"].as_str().unwrap())
+                            .unwrap()
+                            .to_owned(),
+                        m["ticker"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            let moneyline = detail["event"]["markets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| polymarket_moneyline(m))
+                .unwrap();
+            assert!(
+                align_moneyline_with(
+                    outcomes,
+                    [
+                        market_team(moneyline, true).unwrap(),
+                        market_team(moneyline, false).unwrap()
+                    ],
+                    same_college_team
+                )
+                .is_some()
+            );
+            let next_day = Event {
+                id: format!("{league}-a-b-2026-12-31"),
+                title: poly.title.clone(),
+            };
+            assert_eq!(event_match_score(&kalshi, &next_day, sport), 0.0);
+            let duplicates = [poly.clone(), poly];
+            let mut matcher = EventMatcher::new(&duplicates, sport);
+            matcher.block_duplicate_matchups(&[kalshi.clone()]);
+            assert!(matcher.best_match(&kalshi).is_none());
+            assert!(prop_series(sport).is_empty());
+        }
+        let fixture = &fixtures["cbb"];
+        for league in ["cbb", "wcbb"] {
+            let sport = selected_sports(league).unwrap()[0];
+            let spreads = pair_spreads(
+                &fixture["spread"],
+                &fixture["polymarket"],
+                sport,
+                spread_series(sport)[0],
+            );
+            assert_eq!(spreads.len(), 1, "{league}");
+            let totals = pair_totals(
+                &fixture["total"],
+                &fixture["polymarket"],
+                sport,
+                total_series(sport)[0],
+            );
+            assert_eq!(totals.len(), 1, "{league}");
+            let counts = polymarket_counts(
+                &HashMap::from([("sample".into(), fixture["polymarket"].clone())]),
+                sport,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    counts.moneylines,
+                    counts.spreads,
+                    counts.totals,
+                    counts.props
+                ),
+                (1, 1, 1, 0)
+            );
+            let mut wrong_scope = fixture["polymarket"].clone();
+            for m in wrong_scope["event"]["markets"].as_array_mut().unwrap() {
+                if m["sportsMarketType"] == "basketball_team_full_game_spread" {
+                    m["sportsMarketType"] = json!("basketball_team_first_half_spread");
+                }
+                if m["sportsMarketType"] == "basketball_team_full_game_total" {
+                    m["sportsMarketType"] = json!("basketball_team_total_points");
+                }
+            }
+            assert!(
+                pair_spreads(
+                    &fixture["spread"],
+                    &wrong_scope,
+                    sport,
+                    spread_series(sport)[0]
+                )
+                .is_empty()
+            );
+            assert!(
+                pair_totals(
+                    &fixture["total"],
+                    &wrong_scope,
+                    sport,
+                    total_series(sport)[0]
+                )
+                .is_empty()
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn novig_candidate_buys_opposite_outcomes_in_dollar_units() {
-        let pair = Pair {
-            sport: "NFL",
-            title: "A vs. B".into(),
-            market: "Full game moneyline".into(),
-            kalshi: ["K-A".into(), "K-B".into()],
-            teams: ["A".into(), "B".into()],
-            poly_slug: "pm".into(),
-            poly_long_is_first: true,
+    fn nba_fixture() -> Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/nba_markets.json")).unwrap()
+    }
+
+    #[test]
+    fn nba_live_formats_match_events_moneylines_spreads_and_totals() {
+        let fixture = nba_fixture();
+        let sport = selected_sports("nba").unwrap()[0];
+        let game = &fixture["kalshi_game"];
+        let detail = &fixture["polymarket"];
+        let kalshi = Event {
+            id: game["event_ticker"].as_str().unwrap().into(),
+            title: game["title"].as_str().unwrap().into(),
         };
-        let market = novig::Market {
-            id: "n".into(),
-            event: "e".into(),
-            outcomes: [("A-id".into(), "A".into()), ("B-id".into(), "B".into())],
-            fee_coefficient: 0.03,
+        let poly = Event {
+            id: detail["event"]["slug"].as_str().unwrap().into(),
+            title: detail["event"]["title"].as_str().unwrap().into(),
         };
-        let mut book = novig::Book::default();
-        assert!(book.snapshot(
-            &json!({"seq":1,"orders":{"A-id":[{"order":"a","price":"0.600","qty":2500}],"B-id":[]}})
-        ));
-        let kalshi = HashMap::from([(
-            "K-A".into(),
-            KalshiBook {
-                no: BTreeMap::from([(7000, 25.0)]),
-                updated: Some(Instant::now()),
-                generation: 1,
-            },
-        )]);
-        let books = HashMap::from([("n".into(), book)]);
-        let novig_pairs = [NovigPair {
-            pair_index: 0,
-            market,
-            aligned: [0, 1],
-        }];
-        let mut pending = HashMap::from([((0, "Kalshi", 0), (0, 0))]);
-        let mut emitted = HashMap::new();
-        let (sender, mut receiver) = mpsc::channel(1);
-        novig_candidates(
-            0,
-            &[pair],
-            &novig_pairs,
-            &kalshi,
-            &HashMap::new(),
-            &books,
-            &mut pending,
-            &mut emitted,
-            &sender,
+        assert_eq!(event_match_score(&kalshi, &poly, sport), 1.0);
+        let outcomes = game["markets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    kalshi_winner(m["title"].as_str().unwrap())
+                        .unwrap()
+                        .to_owned(),
+                    m["ticker"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let moneyline = detail["event"]["markets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| polymarket_moneyline(m))
+            .unwrap();
+        let aligned = align_moneyline_with(
+            outcomes,
+            [
+                market_team(moneyline, true).unwrap(),
+                market_team(moneyline, false).unwrap(),
+            ],
+            same_nba_team,
         )
-        .await
         .unwrap();
-        let ReportRecord::Novig(record) = receiver.try_recv().unwrap() else {
-            panic!("wrong venue")
-        };
+        assert!(aligned.2);
+        let spreads = pair_spreads(
+            &fixture["kalshi_spread"],
+            detail,
+            sport,
+            NBA_SPREAD_SERIES[0],
+        );
+        assert_eq!(spreads.len(), 1);
+        assert!(!spreads[0].poly_long_is_first);
+        assert!(spreads[0].teams[0].starts_with("Cleveland -15.5"));
+        let totals = pair_totals(&fixture["kalshi_total"], detail, sport, NBA_TOTAL_SERIES[0]);
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].teams, ["Over 213.5", "Under 213.5"]);
+        let counts = polymarket_counts(&HashMap::from([(poly.id, detail.clone())]), sport).unwrap();
         assert_eq!(
             (
-                record.other_outcome.as_str(),
-                record.novig_outcome.as_str(),
-                record.contracts
+                counts.moneylines,
+                counts.spreads,
+                counts.totals,
+                counts.props
             ),
-            ("A", "B", 25)
+            (1, 1, 1, 0)
         );
-        assert!((record.other_fill.cost - 7.5).abs() < 1e-10);
-        assert!((record.novig_fill.cost - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nba_rejects_wrong_date_teams_and_duplicate_games() {
+        let sport = selected_sports("nba").unwrap()[0];
+        let kalshi = Event {
+            id: "KXNBAGAME-26NOV16LALLAC".into(),
+            title: "Los Angeles L vs Los Angeles C".into(),
+        };
+        let poly = Event {
+            id: "nba-lal-lac-2026-11-16".into(),
+            title: "LA Clippers vs. LAL Lakers".into(),
+        };
+        assert_eq!(event_match_score(&kalshi, &poly, sport), 1.0);
+        let next_day = Event {
+            id: "nba-lal-lac-2026-11-17".into(),
+            title: poly.title.clone(),
+        };
+        assert_eq!(event_match_score(&kalshi, &next_day, sport), 0.0);
+        let wrong_team = Event {
+            id: poly.id.clone(),
+            title: "LA Lakers vs. LA Lakers".into(),
+        };
+        assert_eq!(event_match_score(&kalshi, &wrong_team, sport), 0.0);
+        let events = [poly.clone(), next_day];
+        let mut matcher = EventMatcher::new(&events, sport);
+        assert_eq!(matcher.best_match(&kalshi).unwrap().id, poly.id);
+        matcher.block_duplicate_matchups(&[kalshi.clone(), kalshi.clone()]);
+        assert!(matcher.best_match(&kalshi).is_none());
+        let duplicates = [poly.clone(), poly];
+        let mut matcher = EventMatcher::new(&duplicates, sport);
+        matcher.block_duplicate_matchups(&[kalshi.clone()]);
+        assert!(matcher.best_match(&kalshi).is_none());
+    }
+
+    #[test]
+    fn nba_spreads_and_totals_require_exact_scope_line_and_orientation() {
+        let sport = selected_sports("nba").unwrap()[0];
+        let fixture = nba_fixture();
+        let detail = &fixture["polymarket"];
+        for (field, value) in [
+            (
+                "sportsMarketType",
+                json!("basketball_team_first_half_spread"),
+            ),
+            ("line", json!(15.75)),
+            ("line", json!(-15.5)),
+        ] {
+            let mut detail = detail.clone();
+            let markets = detail["event"]["markets"].as_array_mut().unwrap();
+            markets.retain(|m| m["sportsMarketType"] == "basketball_team_full_game_spread");
+            markets[0][field] = value;
+            assert!(
+                pair_spreads(
+                    &fixture["kalshi_spread"],
+                    &detail,
+                    sport,
+                    NBA_SPREAD_SERIES[0]
+                )
+                .is_empty()
+            );
+        }
+        for (field, value) in [
+            ("sportsMarketType", json!("basketball_team_total_points")),
+            (
+                "sportsMarketType",
+                json!("basketball_team_first_half_total"),
+            ),
+            ("line", json!(214.0)),
+        ] {
+            let mut detail = detail.clone();
+            let markets = detail["event"]["markets"].as_array_mut().unwrap();
+            markets.retain(|m| m["sportsMarketType"] == "basketball_team_full_game_total");
+            markets[0][field] = value;
+            assert!(
+                pair_totals(
+                    &fixture["kalshi_total"],
+                    &detail,
+                    sport,
+                    NBA_TOTAL_SERIES[0]
+                )
+                .is_empty()
+            );
+        }
+        let mut integer = fixture["kalshi_spread"].clone();
+        for m in integer["markets"].as_array_mut().unwrap() {
+            m["floor_strike"] = json!(27);
+        }
+        assert!(pair_spreads(&integer, detail, sport, NBA_SPREAD_SERIES[0]).is_empty());
+    }
+
+    #[test]
+    fn market_links_do_not_add_empty_path_segments() {
+        assert_eq!(
+            kalshi_market_url("KXNFLGAME-26NOV01PHIWAS-PHI"),
+            "https://kalshi.com/markets/KXNFLGAME-26NOV01PHIWAS-PHI"
+        );
+        assert_eq!(
+            polymarket_market_url("nfl-phi-was-2026-11-01", "aec-nfl-phi-was-2026-11-01"),
+            "https://polymarket.us/event/nfl-phi-was-2026-11-01?marketSlug=aec-nfl-phi-was-2026-11-01"
+        );
     }
 
     #[test]
@@ -3394,12 +3627,14 @@ mod tests {
     #[test]
     fn pairs_each_kalshi_outcome_with_the_opposite_polymarket_outcome() {
         let pair = Pair {
+            safety: [None, None],
             sport: "test",
             title: "A vs B".into(),
             market: "Full game moneyline".into(),
             kalshi: ["K-A".into(), "K-B".into()],
             teams: ["A".into(), "B".into()],
             poly_slug: "pm-a-b".into(),
+            poly_url: String::new(),
             poly_long_is_first: true,
         };
         assert!((1 == 0) != pair.poly_long_is_first);
@@ -3479,6 +3714,31 @@ mod tests {
     }
 
     #[test]
+    fn pairs_current_polymarket_nfl_game_total_without_team_totals() {
+        let kalshi = json!({"markets":[{"ticker":"K-TOTAL","floor_strike":47.5,"title":"Over 47.5 points?"}]});
+        let polymarket = json!({"event":{"title":"IND Colts vs WAS Commanders","markets":[
+            {"marketType":"totals","sportsMarketType":"football_team_points_full_game_total","line":47.5,"slug":"tsc-nfl-ind-was-2026-10-04-tt-was-47pt5","marketSides":[
+                {"long":true,"description":"Over","team":{"name":"Washington Commanders"}},
+                {"long":false,"description":"Under","team":{"name":"Washington Commanders"}}
+            ]},
+            {"marketType":"totals","sportsMarketType":"football_team_full_game_total","line":47.5,"slug":"tsc-nfl-ind-was-2026-10-04-total-47pt5","marketSides":[
+                {"long":true,"description":"Over"}, {"long":false,"description":"Under"}
+            ]},
+            {"marketType":"totals","sportsMarketType":"football_team_full_game_total","line":47.5,"slug":"tsc-nfl-ind-was-2026-10-04-tt-ind-total-47pt5","marketSides":[
+                {"long":true,"description":"Over","team":{"name":"Indianapolis Colts"}},
+                {"long":false,"description":"Under","team":{"name":"Indianapolis Colts"}}
+            ]}
+        ]}});
+        let sport = selected_sports("nfl").unwrap()[0];
+        let spec = NFL_TOTAL_SERIES[0];
+        let pairs = pair_totals(&kalshi, &polymarket, sport, spec);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].poly_slug, "tsc-nfl-ind-was-2026-10-04-total-47pt5");
+        let details = HashMap::from([("game".to_owned(), polymarket)]);
+        assert_eq!(polymarket_counts(&details, sport).unwrap().totals, 1);
+    }
+
+    #[test]
     fn pairs_only_an_exact_full_game_nfl_player_prop() {
         let kalshi = json!({"markets":[
             {"ticker":"K-PASS","title":"Bo Nix: 225+ passing yards","floor_strike":224.5},
@@ -3516,7 +3776,7 @@ mod tests {
                 {"long":true,"description":"Over","team":{"safeName":"Ohio State"}},
                 {"long":false,"description":"Under","team":{"safeName":"Ohio State"}}
             ]},
-            {"slug":"pm-team","sportsMarketType":"football_team_full_game_total","line":27.5,"marketSides":[
+            {"slug":"pm-team","sportsMarketType":"football_team_points_full_game_total","line":27.5,"marketSides":[
                 {"long":true,"description":"Over","team":{"safeName":"Ohio State"}},
                 {"long":false,"description":"Under","team":{"safeName":"Ohio State"}}
             ]},
@@ -3539,7 +3799,7 @@ mod tests {
     fn team_prop_accepts_the_same_nfl_team_with_venue_specific_names() {
         let kalshi = json!({"markets":[{"ticker":"K-KC","title":"KC Chiefs over 24.5 points scored","floor_strike":24.5}]});
         let polymarket = json!({"event":{"title":"Kansas City vs Miami","markets":[
-            {"slug":"pm-kc","sportsMarketType":"football_team_full_game_total","line":24.5,"marketSides":[
+            {"slug":"pm-kc","sportsMarketType":"football_team_points_full_game_total","line":24.5,"marketSides":[
                 {"long":true,"description":"Over","team":{"safeName":"Kansas City Chiefs"}},
                 {"long":false,"description":"Under","team":{"safeName":"Kansas City Chiefs"}}
             ]}
@@ -3694,6 +3954,43 @@ mod tests {
             &winter,
             &json!({"event":{"startDate":"2026-11-15T19:00:00Z"}})
         ));
+    }
+
+    #[test]
+    fn mlb_matches_polymarket_city_abbreviations_with_team_names() {
+        let sport = selected_sports("mlb").unwrap()[0];
+        for (kalshi_title, poly_title) in [
+            (
+                "Game 3: Philadelphia vs Atlanta",
+                "Game 3: PHI Phillies vs. ATL Braves",
+            ),
+            (
+                "Game 1: Chicago WS vs Cleveland",
+                "Game 1: CHI White Sox vs. CLE Guardians",
+            ),
+            (
+                "Game 1: New York Y vs Tampa Bay",
+                "Game 1: NY Yankees vs. TB Rays",
+            ),
+            (
+                "Game 1: San Diego vs Milwaukee",
+                "Game 1: SD Padres vs. MIL Brewers",
+            ),
+        ] {
+            let kalshi = Event {
+                id: "KXMLBGAME-26OCT031300CWSCLE".into(),
+                title: kalshi_title.into(),
+            };
+            let poly = Event {
+                id: "mlb-cws-cle-2026-10-03".into(),
+                title: poly_title.into(),
+            };
+            assert_eq!(
+                event_match_score(&kalshi, &poly, sport),
+                1.0,
+                "{kalshi_title} / {poly_title}"
+            );
+        }
     }
 
     #[test]
@@ -4090,18 +4387,21 @@ mod tests {
     #[test]
     fn splits_subscriptions_before_the_market_cap() {
         let pair = Pair {
+            safety: [None, None],
             sport: "test",
             title: "A vs B".into(),
             market: "Full game moneyline".into(),
             kalshi: ["K-A".into(), "K-B".into()],
             teams: ["A".into(), "B".into()],
             poly_slug: "pm-a-b".into(),
+            poly_url: String::new(),
             poly_long_is_first: true,
         };
         let pairs = (0..51)
             .map(|index| Pair {
                 kalshi: [format!("K-{index}-A"), format!("K-{index}-B")],
                 poly_slug: format!("pm-{index}"),
+                poly_url: String::new(),
                 ..pair.clone()
             })
             .collect::<Vec<_>>();
@@ -4114,12 +4414,14 @@ mod tests {
     #[test]
     fn indexes_only_pairs_affected_by_each_market_update() {
         let pair = Pair {
+            safety: [None, None],
             sport: "test",
             title: "A vs B".into(),
             market: "Full game moneyline".into(),
             kalshi: ["K-A".into(), "K-B".into()],
             teams: ["A".into(), "B".into()],
             poly_slug: "pm-a-b".into(),
+            poly_url: String::new(),
             poly_long_is_first: true,
         };
         let pairs = [
@@ -4136,40 +4438,17 @@ mod tests {
         assert!(index.by_kalshi.get("other").is_none());
     }
 
-    #[test]
-    fn kalshi_deltas_wait_for_a_full_snapshot() {
-        let mut books = HashMap::from([("K-A".into(), KalshiBook::default())]);
-        let delta = json!({"msg":{"market_ticker":"K-A","side":"no","price_dollars":"0.6000","delta_fp":"2"}});
-        assert_eq!(k_delta(&delta, &mut books), None);
-        assert!(books["K-A"].no.is_empty());
-        let incomplete = json!({"msg":{"market_ticker":"K-A"}});
-        assert_eq!(k_snapshot(&incomplete, &mut books), None);
-        assert!(books["K-A"].updated.is_none());
-        let snapshot = json!({"msg":{"market_ticker":"K-A","no_dollars_fp":[["0.6000","25"]]}});
-        assert_eq!(k_snapshot(&snapshot, &mut books), Some("K-A"));
-        assert_eq!(k_delta(&delta, &mut books), Some("K-A"));
-        assert_eq!(books["K-A"].no.get(&6_000), Some(&27.0));
-    }
-
-    #[test]
-    fn incomplete_polymarket_book_does_not_replace_a_snapshot() {
-        let mut books = HashMap::from([("pm".into(), PolyBook::default())]);
-        let complete = json!({"marketData":{"marketSlug":"pm","bids":[["0.4","10"]],"offers":[]}});
-        assert_eq!(p_book(&complete, &mut books), Some("pm"));
-        let incomplete = json!({"marketData":{"marketSlug":"pm","bids":[]}});
-        assert_eq!(p_book(&incomplete, &mut books), None);
-        assert_eq!(books["pm"].bids.get(&4_000), Some(&10.0));
-    }
-
     #[tokio::test]
     async fn candidate_uses_the_needed_polymarket_side_without_waiting_for_both() {
         let pair = Pair {
+            safety: [Some(safety::approved_test_safety()), None],
             sport: "test",
             title: "A vs B".into(),
             market: "Full game moneyline".into(),
             kalshi: ["K-A".into(), String::new()],
             teams: ["A".into(), "B".into()],
             poly_slug: "pm".into(),
+            poly_url: String::new(),
             poly_long_is_first: false,
         };
         let kalshi = HashMap::from([(
@@ -4198,8 +4477,9 @@ mod tests {
         )]);
         let mut emitted = HashMap::new();
         let (sender, mut receiver) = mpsc::channel(1);
+        let pairs = [pair];
         candidate(
-            &[pair],
+            &pairs,
             &[0],
             &kalshi,
             &polymarket,
@@ -4209,11 +4489,204 @@ mod tests {
         )
         .await
         .unwrap();
-        let ReportRecord::KalshiPolymarket(record) = receiver.try_recv().unwrap() else {
-            panic!("wrong venue")
-        };
+        // Keep the reporting queue full. A second candidate must return
+        // immediately so the receive loop can still process sequence gaps.
+        for observation in pending.values_mut() {
+            observation.kalshi_generation = 0;
+            observation.polymarket_generation = 0;
+        }
+        emitted.clear();
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            candidate(
+                &pairs,
+                &[0],
+                &kalshi,
+                &polymarket,
+                &mut pending,
+                &mut emitted,
+                &sender,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let record = receiver.try_recv().unwrap();
         assert_eq!(record.contracts, 25);
         assert!(record.net_profit >= MIN_NET_PROFIT_DOLLARS);
+    }
+
+    #[tokio::test]
+    async fn candidate_gate_blocks_missing_unapproved_and_expired_metadata() {
+        let kalshi = HashMap::from([(
+            "K-A".into(),
+            KalshiBook {
+                no: BTreeMap::from([(6000, 25.0)]),
+                updated: Some(Instant::now()),
+                generation: 1,
+            },
+        )]);
+        let poly = HashMap::from([(
+            "pm".into(),
+            PolyBook {
+                offers: BTreeMap::from([(5000, 25.0)]),
+                updated: Some(Instant::now()),
+                generation: 1,
+                ..Default::default()
+            },
+        )]);
+        for case in 0..5 {
+            let mut metadata = safety::approved_test_safety();
+            let data = Arc::make_mut(&mut metadata);
+            match case {
+                0 => data.decision.approved = false,
+                1 => data.decision.expires_at = Some(Utc::now() - chrono::Duration::seconds(1)),
+                2 => data.fees = None,
+                3 => {
+                    data.fees.as_mut().unwrap().expires_at =
+                        Utc::now() - chrono::Duration::seconds(1)
+                }
+                _ => {}
+            }
+            let pair = Pair {
+                safety: if case == 4 {
+                    [None, None]
+                } else {
+                    [Some(metadata), None]
+                },
+                sport: "test",
+                title: "A vs B".into(),
+                market: "Full game moneyline".into(),
+                kalshi: ["K-A".into(), String::new()],
+                teams: ["A".into(), "B".into()],
+                poly_slug: "pm".into(),
+                poly_url: String::new(),
+                poly_long_is_first: false,
+            };
+            let (sender, mut receiver) = mpsc::channel(1);
+            let mut pending = HashMap::from([(
+                ("pm", "K-A"),
+                Observation {
+                    kalshi_generation: 0,
+                    polymarket_generation: 0,
+                },
+            )]);
+            candidate(
+                &[pair],
+                &[0],
+                &kalshi,
+                &poly,
+                &mut pending,
+                &mut HashMap::new(),
+                &sender,
+            )
+            .await
+            .unwrap();
+            assert!(receiver.try_recv().is_err(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn account_fee_tier_can_remove_an_apparent_edge() {
+        let k = [(0.47, 100)];
+        let p = [(0.49, 100)];
+        assert!(
+            optimal_matched_fills_with_fees(
+                &k,
+                &p,
+                default_kalshi_fee(),
+                FeeModel::PolymarketStandard {
+                    coefficient: 0.0695
+                }
+            )
+            .is_some()
+        );
+        assert!(
+            optimal_matched_fills_with_fees(
+                &k,
+                &p,
+                default_kalshi_fee(),
+                FeeModel::PolymarketStandard { coefficient: 0.095 }
+            )
+            .is_none()
+        );
+        let mut cursor = FillCursor::new(&[(0.49, 1), (0.50, 1)], default_poly_fee());
+        assert_eq!(cursor.advance().fee, 0.02);
+        assert_eq!(cursor.advance().fee, 0.05);
+    }
+
+    #[test]
+    fn optimal_size_exceeds_old_cap_and_respects_thinner_book() {
+        let k = [(0.30, 250)];
+        let p = [(0.40, 120)];
+        let (kf, pf) = optimal_matched_fills(&k, &p).unwrap();
+        assert_eq!((kf.contracts, pf.contracts), (120, 120));
+        assert_eq!(visible_contracts(&k), 250);
+        assert_eq!(visible_contracts(&p), 120);
+    }
+
+    #[test]
+    fn optimal_size_avoids_depth_that_erases_profit() {
+        let k = [(0.30, 80), (0.65, 100)];
+        let p = [(0.40, 180)];
+        let (kf, pf) = optimal_matched_fills(&k, &p).unwrap();
+        assert_eq!((kf.contracts, pf.contracts), (80, 80));
+        assert!(optimal_matched_fills(&[], &p).is_none());
+        assert!(optimal_matched_fills(&[(0.60, 10)], &p).is_none());
+        assert!(optimal_matched_fills(&[(0.50, 10)], &[(0.495, 10)]).is_none());
+    }
+
+    #[test]
+    fn optimizer_matches_exhaustive_fills_with_rounded_fees_and_both_poly_sides() {
+        // Vary shallow edges, level boundaries, and fractional quantities.
+        // Compare to independent fills at every feasible quantity, including
+        // sizes past a losing marginal level and fee rounding discontinuities.
+        for buy_long in [false, true] {
+            for seed in 0..60 {
+                let k = KalshiBook {
+                    no: BTreeMap::from([(9_400 - seed * 7, 72.8), (8_900 - seed * 7, 61.2)]),
+                    ..Default::default()
+                };
+                let asks = [
+                    (8_800 + seed * 3, 39.9),
+                    (9_100 + seed * 3, 70.1),
+                    (9_800, 90.0),
+                ];
+                let mut p = PolyBook::default();
+                if buy_long {
+                    p.offers = BTreeMap::from(asks);
+                } else {
+                    p.bids = asks
+                        .into_iter()
+                        .map(|(price, qty)| (10_000 - price, qty))
+                        .collect();
+                }
+                let (kl, pl) = executable_levels(&k, &p, buy_long);
+                let mut expected = None;
+                let mut best_net = 0.0;
+                for qty in 1..=visible_contracts(&kl).min(visible_contracts(&pl)) {
+                    let kf = kalshi_yes_fill(&k, qty);
+                    let pf = polymarket_fill(&p, buy_long, qty);
+                    let net = qty as f64 - kf.cost - pf.cost - kf.fee - pf.fee;
+                    if net > best_net + 1e-9 {
+                        best_net = net;
+                        expected = Some((kf, pf));
+                    }
+                }
+                let actual = optimal_matched_fills(&kl, &pl);
+                assert_eq!(
+                    actual.as_ref().map(|(k, _)| k.contracts),
+                    expected.as_ref().map(|(k, _)| k.contracts)
+                );
+                if let (Some((ak, ap)), Some((ek, ep))) = (actual, expected) {
+                    for (a, e) in [(ak, ek), (ap, ep)] {
+                        assert!((a.cost - e.cost).abs() < 1e-9);
+                        assert!((a.fee - e.fee).abs() < 1e-9);
+                        assert_eq!(a.levels, e.levels);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4281,8 +4754,8 @@ mod tests {
 
 async fn run_session(
     pairs: &[Pair],
-    novig_pairs: &[NovigPair],
-    reporter: &mpsc::Sender<ReportRecord>,
+    reporter: &mpsc::Sender<CandidateRecord>,
+    refresh: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let index = pair_index(pairs);
     let tickers: Vec<String> = pairs
@@ -4298,6 +4771,7 @@ async fn run_session(
         .collect();
     let slugs: Vec<String> = pairs
         .iter()
+        .filter(|pair| !pair.poly_slug.is_empty())
         .map(|pair| pair.poly_slug.clone())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -4326,44 +4800,10 @@ async fn run_session(
             ("X-PM-Signature", poly_sig(&t, "/v1/ws/markets")?),
         ],
     )?;
-    let ((mut ks, _), (mut ps, _), mut ns) = tokio::try_join!(
-        async { Ok::<_, Box<dyn Error>>(connect_async(kr).await?) },
-        async { Ok::<_, Box<dyn Error>>(connect_async(pr).await?) },
-        async {
-            if novig_pairs.is_empty() {
-                return Ok::<_, Box<dyn Error>>(None);
-            }
-            let attempt = async {
-                let nr = request(novig::hosts()?.1, &novig::websocket_headers()?)?;
-                Ok::<_, Box<dyn Error>>(connect_async(nr).await?.0)
-            }
-            .await;
-            match attempt {
-                Ok(socket) => Ok(Some(socket)),
-                Err(error) => {
-                    eprintln!(
-                        "Novig stream unavailable ({error}); continuing Kalshi/Polymarket scan. The Novig stream requires a trading or trading::read key."
-                    );
-                    Ok(None)
-                }
-            }
-        },
-    )?;
-    ks.send(Message::Text(json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":tickers}}).to_string().into())).await?;
-    ps.send(Message::Text(json!({"subscribe":{"requestId":"read-only-scanner","subscriptionType":"SUBSCRIPTION_TYPE_MARKET_DATA","marketSlugs":slugs}}).to_string().into())).await?;
-    if let Some(socket) = &mut ns {
-        let markets = novig_pairs
-            .iter()
-            .map(|entry| (entry.market.id.clone(), "book"))
-            .collect::<HashMap<_, _>>();
-        socket
-            .send(Message::Text(
-                json!({"nonce":1,"subscribe":{"markets":markets}})
-                    .to_string()
-                    .into(),
-            ))
-            .await?;
-    }
+    let (kalshi, polymarket) = tokio::try_join!(connect_async(kr), connect_async(pr))?;
+    let (mut ks, mut ps) = (kalshi.0, polymarket.0);
+    ks.send(Message::Text(json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":tickers,"update_interval_ms":0}}).to_string().into())).await?;
+    ps.send(Message::Text(json!({"subscribe":{"requestId":"read-only-scanner","subscriptionType":"SUBSCRIPTION_TYPE_MARKET_DATA","marketSlugs":slugs,"responsesDebounced":false}}).to_string().into())).await?;
     // These books intentionally exist only for one connection session. A reconnect
     // starts empty and waits for new snapshots before any candidate can be emitted.
     let mut kb = tickers
@@ -4374,73 +4814,69 @@ async fn run_session(
         .iter()
         .map(|slug| (slug.clone(), PolyBook::default()))
         .collect::<HashMap<_, _>>();
-    let mut nb = novig_pairs
-        .iter()
-        .map(|entry| (entry.market.id.clone(), novig::Book::default()))
-        .collect::<HashMap<_, _>>();
-    let mut novig_pending = HashMap::new();
-    let mut novig_emitted = HashMap::new();
-    let mut novig_nonce = 1_u64;
     let (mut pending, mut emitted) = (HashMap::new(), HashMap::new());
-    let refresh_timer = tokio::time::sleep(DISCOVERY_REFRESH);
+    let mut kalshi_integrity = KalshiIntegrity::default();
+    let mut poly_integrity = PolyIntegrity::default();
+    let connected = Instant::now();
+    let mut feed_health = FeedHealth::default();
+    let mut health = tokio::time::interval(Duration::from_secs(1));
+    let refresh_timer = tokio::time::sleep(refresh);
     tokio::pin!(refresh_timer);
     loop {
         tokio::select! {
-            _ = &mut refresh_timer => return Ok(()),
+            _ = &mut refresh_timer => {
+                if kalshi_integrity.initialized()<tickers.len() || poly_integrity.initialized()<slugs.len() {
+                    return Err("session ended before all initial books were validated".into());
+                }
+                return Ok(());
+            },
+            _ = health.tick() => {
+                let elapsed = connected.elapsed().as_millis() as u64;
+                if feed_health.check(elapsed, [tickers.len(),slugs.len()], [kalshi_integrity.initialized(),poly_integrity.initialized()])? {
+                    tokio::time::timeout(Duration::from_secs(1), ks.send(Message::Ping(Vec::new().into()))).await??;
+                    tokio::time::timeout(Duration::from_secs(1), ps.send(Message::Ping(Vec::new().into()))).await??;
+                    feed_health.ping_sent(elapsed);
+                }
+            },
             message = ks.next() => {
                 let message = message.ok_or("Kalshi WebSocket closed")??;
-                if let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
-                    let changed = match value["type"].as_str() {
-                        Some("orderbook_snapshot") => k_snapshot(&value, &mut kb),
-                        Some("orderbook_delta") => k_delta(&value, &mut kb),
-                        _ => None,
-                    };
-                    if let Some(indices) = changed.and_then(|ticker| index.by_kalshi.get(ticker)) {
-                        candidate(pairs, indices, &kb, &pb, &mut pending, &mut emitted, reporter).await?;
-                        for &i in indices { novig_candidates(i, pairs, novig_pairs, &kb, &pb, &nb, &mut novig_pending, &mut novig_emitted, reporter).await?; }
-                    }
+                match message {
+                    Message::Text(text) => {
+                        let value: Value = serde_json::from_str(&text).map_err(|_| "malformed Kalshi JSON")?;
+                        let changed = kalshi_integrity.apply(&value, &mut kb, Utc::now().timestamp_millis())?;
+                        if let Some(indices) = changed.and_then(|ticker| index.by_kalshi.get(ticker)) {
+                            candidate(pairs, indices, &kb, &pb, &mut pending, &mut emitted, reporter).await?;
+                        }
+                    },
+                    Message::Ping(payload) => { tokio::time::timeout(Duration::from_secs(1), ks.send(Message::Pong(payload))).await??; },
+                    Message::Pong(_) => {},
+                    Message::Close(_) => return Err("Kalshi WebSocket closed".into()),
+                    _ => return Err("unsupported Kalshi WebSocket frame".into()),
                 }
-            }
+                feed_health.received(0,connected.elapsed().as_millis() as u64);
+            },
             message = ps.next() => {
                 let message = message.ok_or("Polymarket WebSocket closed")??;
-                if let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
-                    if let Some(indices) = p_book(&value, &mut pb).and_then(|slug| index.by_polymarket.get(slug)) {
-                        candidate(pairs, indices, &kb, &pb, &mut pending, &mut emitted, reporter).await?;
-                        for &i in indices { novig_candidates(i, pairs, novig_pairs, &kb, &pb, &nb, &mut novig_pending, &mut novig_emitted, reporter).await?; }
-                    }
-                }
-            }
-            message = async { match &mut ns { Some(socket) => socket.next().await, None => std::future::pending().await } } => {
-                let message = match message {
-                    Some(Ok(message)) => message,
-                    Some(Err(error)) => { eprintln!("Novig stream disconnected ({error}); continuing Kalshi/Polymarket scan."); ns = None; nb.clear(); continue; }
-                    None => { eprintln!("Novig stream closed; continuing Kalshi/Polymarket scan."); ns = None; nb.clear(); continue; }
-                };
-                if let Message::Ping(payload) = message {
-                    if let Some(socket) = &mut ns { socket.send(Message::Pong(payload)).await?; }
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) else { continue; };
-                for field in ["snapshot", "delta"] {
-                    let Some(entries) = value[field].as_object() else { continue; };
-                    for (market_id, entry) in entries {
-                        let Some(book) = nb.get_mut(market_id) else { continue; };
-                        let Some(payload) = entry.get("book") else { continue; };
-                        let valid = if field == "snapshot" { book.snapshot(payload) } else { book.delta(payload) };
-                        if !valid {
-                            book.invalidate();
-                            novig_nonce += 1;
-                            if let Some(socket) = &mut ns {
-                                let selection = HashMap::from([(market_id.clone(), "book")]);
-                                socket.send(Message::Text(json!({"nonce":novig_nonce,"snapshot":{"markets":selection}}).to_string().into())).await?;
+                match message {
+                    Message::Text(text) => {
+                        let value: Value = serde_json::from_str(&text).map_err(|_| "malformed Polymarket JSON")?;
+                        let changed = poly_integrity.apply(&value, &mut pb, Utc::now().timestamp_millis())?;
+                        if let Some(slug) = changed {
+                            if pb[slug].updated.is_none() {
+                                pending.retain(|(market, _), _| *market != slug);
+                                emitted.retain(|(market, _), _| *market != slug);
                             }
-                            continue;
+                            if let Some(indices) = index.by_polymarket.get(slug) {
+                                candidate(pairs, indices, &kb, &pb, &mut pending, &mut emitted, reporter).await?;
+                            }
                         }
-                        for entry in novig_pairs.iter().filter(|entry| entry.market.id == *market_id) {
-                            novig_candidates(entry.pair_index, pairs, novig_pairs, &kb, &pb, &nb, &mut novig_pending, &mut novig_emitted, reporter).await?;
-                        }
-                    }
+                    },
+                    Message::Ping(payload) => { tokio::time::timeout(Duration::from_secs(1), ps.send(Message::Pong(payload))).await??; },
+                    Message::Pong(_) => {},
+                    Message::Close(_) => return Err("Polymarket WebSocket closed".into()),
+                    _ => return Err("unsupported Polymarket WebSocket frame".into()),
                 }
+                feed_health.received(1,connected.elapsed().as_millis() as u64);
             }
         }
     }
@@ -4461,7 +4897,7 @@ fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
             .iter()
             .filter(|ticker| !tickers.contains(*ticker))
             .count();
-        let adds_slug = usize::from(!slugs.contains(&pair.poly_slug));
+        let adds_slug = usize::from(!pair.poly_slug.is_empty() && !slugs.contains(&pair.poly_slug));
         if !batches.is_empty()
             && (tickers.len() + adds_tickers > MAX_MARKETS_PER_SUBSCRIPTION
                 || slugs.len() + adds_slug > MAX_MARKETS_PER_SUBSCRIPTION)
@@ -4474,7 +4910,9 @@ fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
             batches.push(Vec::new());
         }
         tickers.extend(next_tickers);
-        slugs.insert(pair.poly_slug.clone());
+        if !pair.poly_slug.is_empty() {
+            slugs.insert(pair.poly_slug.clone());
+        }
         batches.last_mut().expect("batch exists").push(pair.clone());
     }
     batches
@@ -4482,35 +4920,14 @@ fn subscription_batches(pairs: &[Pair]) -> Vec<Vec<Pair>> {
 
 async fn run_batches(
     pairs: &[Pair],
-    novig_pairs: &[NovigPair],
-    reporter: &mpsc::Sender<ReportRecord>,
+    reporter: &mpsc::Sender<CandidateRecord>,
+    refresh: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let batches = subscription_batches(pairs);
-    let local = batches
-        .iter()
-        .map(|batch| {
-            let indices = batch
-                .iter()
-                .enumerate()
-                .map(|(i, pair)| (pair.poly_slug.as_str(), i))
-                .collect::<HashMap<_, _>>();
-            novig_pairs
-                .iter()
-                .filter_map(|entry| {
-                    let i = *indices.get(pairs[entry.pair_index].poly_slug.as_str())?;
-                    Some(NovigPair {
-                        pair_index: i,
-                        ..entry.clone()
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
     try_join_all(
         batches
             .iter()
-            .zip(&local)
-            .map(|(batch, novig)| run_session(batch, novig, reporter)),
+            .map(|batch| run_session(batch, reporter, refresh)),
     )
     .await?;
     Ok(())
@@ -4525,9 +4942,6 @@ fn reconnect_delay(attempt: u32) -> Duration {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
     let selection = env::args().nth(1).unwrap_or_else(|| "cfb".into());
-    if selection == "novig-check" {
-        return check_novig().await;
-    }
     if selection == "preview" {
         print_candidate_preview().await?;
         return Ok(());
@@ -4540,6 +4954,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 format!("Usage: cargo run --bin stream_scanner -- {SCANNER_USAGE}")
             })?)
         };
+    if env::args().skip(2).any(|arg| arg == "--review") {
+        let client = Client::builder()
+            .user_agent("arbitrage-executor-rules-review/0.1")
+            .timeout(Duration::from_secs(20))
+            .build()?;
+        if let Some(sports) = sports {
+            discover_sports(&client, sports).await?;
+        } else {
+            for selection in [
+                "cfb", "nfl", "nba", "cbb", "wcbb", "mlb", "cs2", "valorant", "dota2", "lol", "r6",
+                "atp", "wta",
+            ] {
+                discover_sports(
+                    &client,
+                    selected_sports(selection).expect("supported selection"),
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+    if env::args().skip(2).any(|arg| arg == "--feed-check") {
+        let sports = sports.ok_or("--feed-check requires a specific sport, not all")?;
+        let client = Client::builder()
+            .user_agent("arbitrage-executor-feed-check/0.1")
+            .timeout(Duration::from_secs(20))
+            .build()?;
+        let discovery = discover_sports(&client, sports).await?;
+        let pair = discovery
+            .pairs
+            .first()
+            .ok_or("no matched pair available for feed check")?;
+        let (sender, _receiver) = mpsc::channel(1);
+        run_session(std::slice::from_ref(pair), &sender, Duration::from_secs(10)).await?;
+        println!(
+            "Feed check passed for one matched pair over 10 seconds. Source timestamps, book contents, and Kalshi sequences validated. No orders sent or balances read."
+        );
+        return Ok(());
+    }
     let journal = OpenOptions::new()
         .create(true)
         .append(true)
@@ -4562,6 +5015,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let nfl = scan_forever(
             "nfl",
             selected_sports("nfl").expect("supported selection"),
+            &reporter_tx,
+        );
+        let cbb = scan_forever(
+            "cbb",
+            selected_sports("cbb").expect("supported selection"),
+            &reporter_tx,
+        );
+        let wcbb = scan_forever(
+            "wcbb",
+            selected_sports("wcbb").expect("supported selection"),
+            &reporter_tx,
+        );
+        let nba = scan_forever(
+            "nba",
+            selected_sports("nba").expect("supported selection"),
             &reporter_tx,
         );
         let mlb = scan_forever(
@@ -4604,7 +5072,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             selected_sports("wta").expect("supported selection"),
             &reporter_tx,
         );
-        tokio::try_join!(cfb, nfl, mlb, cs2, valorant, dota2, lol, r6, atp, wta)?;
+        tokio::try_join!(
+            cfb, nfl, nba, cbb, wcbb, mlb, cs2, valorant, dota2, lol, r6, atp, wta
+        )?;
         Ok(())
     };
     tokio::pin!(reporting, scanning);
@@ -4615,108 +5085,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Err("candidate reporter stopped unexpectedly".into())
         }
     }
-}
-
-async fn check_novig() -> Result<(), Box<dyn Error>> {
-    if !novig::enabled()? {
-        return Err("set NOVIG_KEY_ID and NOVIG_PRIVATE_KEY_PATH in .env".into());
-    }
-    let client = Client::builder()
-        .user_agent("arbitrage-executor-read-only/0.1")
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let market = novig::moneyline_markets(&client, "NFL")
-        .await?
-        .into_iter()
-        .next()
-        .ok_or("No open Novig NFL moneyline to test")?;
-    let request = request(novig::hosts()?.1, &novig::websocket_headers()?)?;
-    let (mut socket, _) = match tokio::time::timeout(
-        Duration::from_secs(10),
-        connect_async(request),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
-            let code = response
-                .body()
-                .as_ref()
-                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-                .and_then(|body| body["code"].as_str().map(str::to_owned));
-            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
-                && code.as_deref() == Some("SIGNATURE_REJECTED")
-            {
-                let management_access = async {
-                    let path = "/v3/account/subaccounts";
-                    let mut get = client.get(format!("{}{}", novig::hosts()?.0, path));
-                    for (name, value) in novig::signed_get_headers(path)? {
-                        get = get.header(name, value);
-                    }
-                    let response = get.send().await?;
-                    if !response.status().is_success() {
-                        return Ok::<_, Box<dyn Error>>(None);
-                    }
-                    let body: Value = response.json().await?;
-                    Ok(body.as_array().map(Vec::len))
-                }
-                .await
-                .ok()
-                .flatten();
-                if let Some(count) = management_access {
-                    return Err(format!("Novig verified this management key, but it cannot stream books. Existing subaccounts: {count}. Create a trading::read key for a subaccount.").into());
-                }
-                return Err("Novig signature verified, but this key lacks WebSocket scope. Use a trading or trading::read key for a subaccount.".into());
-            }
-            return Err(format!(
-                "Novig WebSocket rejected the key (HTTP {}, code: {})",
-                response.status(),
-                code.as_deref().unwrap_or("unavailable")
-            )
-            .into());
-        }
-        Ok(Err(error)) => {
-            return Err(format!("Novig WebSocket connection failed: {error}").into());
-        }
-        Err(_) => return Err("Novig WebSocket connection timed out".into()),
-    };
-    println!("Novig WebSocket authentication: OK");
-    let selection = HashMap::from([(market.id.clone(), "book")]);
-    socket
-        .send(Message::Text(
-            json!({"nonce":1,"subscribe":{"markets":selection}})
-                .to_string()
-                .into(),
-        ))
-        .await?;
-    let snapshot = async {
-        while let Some(message) = socket.next().await {
-            let message = message?;
-            if let Message::Ping(payload) = message {
-                socket.send(Message::Pong(payload)).await?;
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) else {
-                continue;
-            };
-            if let Some(code) = value["code"].as_str() {
-                return Err(format!("Novig subscription rejected: {code}").into());
-            }
-            if let Some(book) = value["snapshot"][&market.id].get("book") {
-                let mut parsed = novig::Book::default();
-                if !parsed.snapshot(book) {
-                    return Err("Novig book snapshot failed validation".into());
-                }
-                return Ok::<_, Box<dyn Error>>(());
-            }
-        }
-        Err("Novig WebSocket closed before a book snapshot".into())
-    };
-    tokio::time::timeout(Duration::from_secs(10), snapshot)
-        .await
-        .map_err(|_| "Novig book snapshot timed out")??;
-    println!("Novig book subscription and snapshot: OK");
-    Ok(())
 }
 
 async fn print_candidate_preview() -> Result<(), Box<dyn Error>> {
@@ -4795,12 +5163,16 @@ async fn print_candidate_preview() -> Result<(), Box<dyn Error>> {
                 net,
                 contracts,
                 DisplaySide {
+                    url: "unavailable (synthetic preview)",
+                    available: contracts,
                     outcome: kalshi_team,
                     average_price: kalshi_price,
                     fee: kalshi_fee,
                     levels: kalshi_levels,
                 },
                 DisplaySide {
+                    url: "unavailable (synthetic preview)",
+                    available: contracts,
                     outcome: poly_team,
                     average_price: poly_price,
                     fee: poly_fee,
@@ -4814,18 +5186,9 @@ async fn print_candidate_preview() -> Result<(), Box<dyn Error>> {
 }
 
 async fn discover_sports(client: &Client, sports: &[Sport]) -> Result<Discovery, Box<dyn Error>> {
-    let mut combined = Discovery {
-        pairs: Vec::new(),
-        novig_pairs: Vec::new(),
-    };
+    let mut combined = Discovery { pairs: Vec::new() };
     for sport in sports {
-        let mut found = discover(client, *sport).await?;
-        let offset = combined.pairs.len();
-        for entry in &mut found.novig_pairs {
-            entry.pair_index += offset;
-        }
-        combined.pairs.extend(found.pairs);
-        combined.novig_pairs.extend(found.novig_pairs);
+        combined.pairs.extend(discover(client, *sport).await?.pairs);
     }
     Ok(combined)
 }
@@ -4833,10 +5196,11 @@ async fn discover_sports(client: &Client, sports: &[Sport]) -> Result<Discovery,
 async fn scan_forever(
     selection: &str,
     sports: &[Sport],
-    reporter: &mpsc::Sender<ReportRecord>,
+    reporter: &mpsc::Sender<CandidateRecord>,
 ) -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .user_agent("arbitrage-executor-read-only/0.1")
+        .timeout(Duration::from_secs(20))
         .build()?;
     let mut reconnect_attempt = 0;
     let mut prepared_pairs = None;
@@ -4860,9 +5224,10 @@ async fn scan_forever(
                 continue;
             }
         };
-        let active = run_batches(&discovery.pairs, &discovery.novig_pairs, reporter);
+        let refresh = DISCOVERY_REFRESH;
+        let active = run_batches(&discovery.pairs, reporter, refresh);
         let prefetch = async {
-            tokio::time::sleep(DISCOVERY_REFRESH - DISCOVERY_PREFETCH_LEAD).await;
+            tokio::time::sleep(refresh - DISCOVERY_PREFETCH_LEAD).await;
             discover_sports(&client, sports).await
         };
         tokio::pin!(active, prefetch);

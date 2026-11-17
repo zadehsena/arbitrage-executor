@@ -1,0 +1,18 @@
+{
+  "fingerprint": "COPY_AN_EXACT_DIRECTION_FINGERPRINT_FROM_THE_REVIEW_REPORT",
+  "reviewed_by": "",
+  "reviewed_at": "2000-01-01T00:00:00Z",
+  "expires_at": "2000-01-02T00:00:00Z",
+  "notes": "",
+  "sources": [],
+  "checks": {
+    "same_event_and_participants": false,
+    "same_statistic_line_and_period": false,
+    "overtime_and_ties": false,
+    "postponement_and_rescheduling": false,
+    "cancellation_void_and_fair_price": false,
+    "abandonment_retirement_and_participation": false,
+    "settlement_sources_and_corrections": false,
+    "combined_payout_at_least_one_dollar_in_all_cases": false
+  }
+}

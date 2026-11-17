@@ -1,4 +1,6 @@
-use arbitrage_executor::sports::{SPORTS_USAGE, selected_sports};
+use arbitrage_executor::sports::{
+    SPORTS_USAGE, Sport, same_college_team, same_nba_team, selected_sports,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer as _, pkcs8::DecodePrivateKey as _};
 use rand::rngs::OsRng;
@@ -121,9 +123,12 @@ fn same_team(left: &str, right: &str) -> bool {
 }
 
 fn kalshi_winner(title: &str) -> Option<&str> {
-    title
-        .strip_suffix(" wins")
-        .or_else(|| title.strip_prefix("Will ")?.split_once(" win the ").map(|(team, _)| team))
+    title.strip_suffix(" wins").or_else(|| {
+        title
+            .strip_prefix("Will ")?
+            .split_once(" win the ")
+            .map(|(team, _)| team)
+    })
 }
 
 fn event_team_keys(value: &str) -> Option<[String; 2]> {
@@ -296,9 +301,46 @@ async fn event_refs(
     Ok((kalshi_events, polymarket_events))
 }
 
+fn dated_team_event_similarity(
+    kalshi: &EventRef,
+    poly: &EventRef,
+    same: fn(&str, &str) -> bool,
+) -> f64 {
+    let kalshi_date = kalshi
+        .id
+        .split_once('-')
+        .and_then(|(_, suffix)| suffix.get(..7))
+        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%y%b%d").ok());
+    let poly_date = poly
+        .id
+        .get(poly.id.len().saturating_sub(10)..)
+        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    if kalshi_date.is_none() || kalshi_date != poly_date {
+        return 0.0;
+    }
+    let teams = |title: &str| -> Option<[String; 2]> {
+        let (a, b) = title
+            .split_once(':')
+            .unwrap_or((title, ""))
+            .0
+            .split_once("vs")?;
+        Some([a.to_owned(), b.to_owned()])
+    };
+    match (teams(&kalshi.title), teams(&poly.title)) {
+        (Some(a), Some(b))
+            if (same(&a[0], &b[0]) && same(&a[1], &b[1]))
+                || (same(&a[0], &b[1]) && same(&a[1], &b[0])) =>
+        {
+            1.0
+        }
+        _ => 0.0,
+    }
+}
+
 fn match_events(
     kalshi: Vec<EventRef>,
     polymarket: Vec<EventRef>,
+    sport: Sport,
 ) -> Vec<(EventRef, EventRef, f64)> {
     let mut remaining = kalshi;
     let mut matches = Vec::new();
@@ -306,7 +348,18 @@ fn match_events(
         let Some((index, score)) = remaining
             .iter()
             .enumerate()
-            .map(|(index, event)| (index, event_similarity(&event.title, &poly.title)))
+            .map(|(index, event)| {
+                (
+                    index,
+                    if sport.label == "NBA" {
+                        dated_team_event_similarity(event, &poly, same_nba_team)
+                    } else if matches!(sport.label, "CBB" | "WCBB") {
+                        dated_team_event_similarity(event, &poly, same_college_team)
+                    } else {
+                        event_similarity(&event.title, &poly.title)
+                    },
+                )
+            })
             .max_by(|left, right| left.1.total_cmp(&right.1))
         else {
             continue;
@@ -374,6 +427,7 @@ async fn inspect_match(
     kalshi: &EventRef,
     polymarket: &EventRef,
     score: f64,
+    sport: Sport,
 ) -> Result<(), Box<dyn Error>> {
     let kalshi_url = format!("{KALSHI_BASE_URL}/events/{}", kalshi.id);
     let polymarket_url = format!("{POLYMARKET_US_BASE_URL}/v1/events/slug/{}", polymarket.id);
@@ -388,11 +442,16 @@ async fn inspect_match(
     if kalshi_markets.len() != 2 || polymarket_markets.len() != 2 {
         return Ok(());
     }
+    let same = match sport.label {
+        "NBA" => same_nba_team,
+        "CBB" | "WCBB" => same_college_team,
+        _ => same_team,
+    };
     let mut aligned: Vec<(&MarketRef, &MarketRef)> = Vec::new();
     for kalshi_market in &kalshi_markets {
         let matching = polymarket_markets
             .iter()
-            .filter(|market| same_team(&kalshi_market.outcome, &market.outcome))
+            .filter(|market| same(&kalshi_market.outcome, &market.outcome))
             .collect::<Vec<_>>();
         if matching.len() != 1 {
             return Ok(());
@@ -466,14 +525,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for sport in sports {
         let (kalshi, polymarket) =
             event_refs(&client, sport.polymarket_league, sport.kalshi_series, 40).await?;
-        let matches = match_events(kalshi, polymarket);
+        let matches = match_events(kalshi, polymarket, *sport);
         println!(
             "Read-only executable probe: {} likely {} event matches. Only GET market-data endpoints are called.",
             matches.len(),
             sport.label
         );
         for (kalshi, polymarket, score) in matches.into_iter().take(5) {
-            inspect_match(&client, &kalshi, &polymarket, score).await?;
+            inspect_match(&client, &kalshi, &polymarket, score, *sport).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -482,8 +541,74 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_similarity, kalshi_winner, polymarket_moneyline_markets};
+    use super::{
+        EventRef, dated_team_event_similarity, event_similarity, kalshi_winner,
+        polymarket_moneyline_markets,
+    };
     use serde_json::json;
+
+    #[test]
+    fn college_probe_matches_school_aliases_and_womens_names() {
+        for (series, league, title, other) in [
+            (
+                "KXNCAAMBGAME",
+                "cbb",
+                "Alcorn St. vs Maryland",
+                "Alcorn State vs. Maryland",
+            ),
+            (
+                "KXNCAAWBGAME",
+                "wcbb",
+                "Kansas St. vs Michigan",
+                "K-State (W) vs. Michigan (W)",
+            ),
+        ] {
+            let kalshi = EventRef {
+                id: format!("{series}-26NOV16AB"),
+                title: title.into(),
+            };
+            let mut poly = EventRef {
+                id: format!("{league}-a-b-2026-11-16"),
+                title: other.into(),
+            };
+            assert_eq!(
+                dated_team_event_similarity(&kalshi, &poly, super::same_college_team),
+                1.0
+            );
+            poly.title = "Kansas State vs. Michigan State".into();
+            assert_eq!(
+                dated_team_event_similarity(&kalshi, &poly, super::same_college_team),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn nba_probe_matches_exact_teams_and_date() {
+        let kalshi = EventRef {
+            id: "KXNBAGAME-26NOV16CHICLE".into(),
+            title: "Chicago vs Cleveland".into(),
+        };
+        let mut poly = EventRef {
+            id: "nba-chi-cle-2026-11-16".into(),
+            title: "CHI Bulls vs. CLE Cavaliers".into(),
+        };
+        assert_eq!(
+            dated_team_event_similarity(&kalshi, &poly, super::same_nba_team),
+            1.0
+        );
+        poly.id = "nba-chi-cle-2026-11-17".into();
+        assert_eq!(
+            dated_team_event_similarity(&kalshi, &poly, super::same_nba_team),
+            0.0
+        );
+        poly.id = "nba-chi-cle-2026-11-16".into();
+        poly.title = "CHI Bulls vs. DET Pistons".into();
+        assert_eq!(
+            dated_team_event_similarity(&kalshi, &poly, super::same_nba_team),
+            0.0
+        );
+    }
 
     #[test]
     fn moneyline_uses_side_flags_even_when_the_api_reorders_sides() {
@@ -500,7 +625,10 @@ mod tests {
     #[test]
     fn matches_abbreviated_mlb_team_names() {
         assert_eq!(
-            event_similarity("New York M vs Washington", "New York Mets vs. Washington Nationals"),
+            event_similarity(
+                "New York M vs Washington",
+                "New York Mets vs. Washington Nationals"
+            ),
             1.0
         );
     }

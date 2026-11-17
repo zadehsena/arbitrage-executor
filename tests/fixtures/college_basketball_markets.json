@@ -1,0 +1,498 @@
+{
+  "cbb": {
+    "kalshi": {
+      "event_ticker": "KXNCAAMBGAME-26NOV16ALCNMD",
+      "title": "Alcorn St. vs Maryland",
+      "markets": [
+        {
+          "status": "active",
+          "ticker": "KXNCAAMBGAME-26NOV16ALCNMD-MD",
+          "title": "Maryland wins",
+          "yes_sub_title": "Maryland"
+        },
+        {
+          "status": "active",
+          "ticker": "KXNCAAMBGAME-26NOV16ALCNMD-ALCN",
+          "title": "Alcorn St. wins",
+          "yes_sub_title": "Alcorn St."
+        }
+      ]
+    },
+    "polymarket": {
+      "event": {
+        "slug": "cbb-alcst-mary-2026-11-16",
+        "title": "Alcorn State vs. Maryland",
+        "startDate": "2026-11-16T23:00:00Z",
+        "markets": [
+          {
+            "question": "Will Alcorn State cover +56.5 vs Maryland in Alcorn State vs. Maryland?",
+            "slug": "asc-cbb-alcst-mary-2026-11-16-pos-56pt5",
+            "active": true,
+            "marketType": "spreads",
+            "closed": false,
+            "archived": false,
+            "sportsMarketType": "basketball_team_full_game_spread",
+            "line": 56.5,
+            "status": "MARKET_STATUS_OPEN",
+            "title": "Maryland wins by over 56.5 points",
+            "marketSides": [
+              {
+                "description": "+56.50",
+                "long": true,
+                "teamId": 1964,
+                "team": {
+                  "name": "Alcorn State",
+                  "safeName": "Alcorn State"
+                }
+              },
+              {
+                "description": "-56.50",
+                "long": false,
+                "teamId": 1751,
+                "team": {
+                  "name": "Maryland",
+                  "safeName": "Maryland"
+                }
+              }
+            ]
+          },
+          {
+            "question": "Will the total in Alcorn State vs. Maryland be more than 160.5?",
+            "slug": "tsc-cbb-alcst-mary-2026-11-16-160pt5",
+            "active": true,
+            "marketType": "totals",
+            "closed": false,
+            "archived": false,
+            "sportsMarketType": "basketball_team_full_game_total",
+            "line": 160.5,
+            "status": "MARKET_STATUS_OPEN",
+            "title": "Over 160.5 total points",
+            "marketSides": [
+              {
+                "description": "Over",
+                "long": true
+              },
+              {
+                "description": "Under",
+                "long": false
+              }
+            ]
+          },
+          {
+            "question": "Who will win in the upcoming basketball event Alcorn State vs Maryland scheduled for November 16, 2026 at 6:00PM ET?",
+            "slug": "aec-cbb-alcst-mary-2026-11-16",
+            "active": true,
+            "marketType": "moneyline",
+            "closed": false,
+            "archived": false,
+            "sportsMarketType": "basketball_team_full_game_winner",
+            "status": "MARKET_STATUS_OPEN",
+            "title": "Alcorn State vs Maryland",
+            "marketSides": [
+              {
+                "description": "Braves",
+                "long": true,
+                "teamId": 1964,
+                "team": {
+                  "name": "Alcorn State",
+                  "safeName": "Alcorn State"
+                }
+              },
+              {
+                "description": "Terrapins",
+                "long": false,
+                "teamId": 1751,
+                "team": {
+                  "name": "Maryland",
+                  "safeName": "Maryland"
+                }
+              }
+            ]
+          },
+          {
+            "question": "Will Alcorn State cover +16.5 vs Maryland in the first half of Alcorn State vs. Maryland?",
+            "slug": "asc-cbb-alcst-mary-2026-11-16-fh-pos-16pt5",
+            "active": true,
+            "marketType": "spreads",
+            "closed": true,
+            "archived": false,
+            "sportsMarketType": "basketball_team_first_half_spread",
+            "line": 16.5,
+            "status": "MARKET_STATUS_RESOLVED",
+            "title": "Maryland wins by over 16.5 points in 1st half",
+            "marketSides": [
+              {
+                "description": "+16.50",
+                "long": true,
+                "teamId": 1964,
+                "team": {
+                  "name": "Alcorn State",
+                  "safeName": "Alcorn State"
+                }
+              },
+              {
+                "description": "-16.50",
+                "long": false,
+                "teamId": 1751,
+                "team": {
+                  "name": "Maryland",
+                  "safeName": "Maryland"
+                }
+              }
+            ]
+          },
+          {
+            "question": "Will the first half total in Alcorn State vs. Maryland be more than 70.5?",
+            "slug": "tsc-cbb-alcst-mary-2026-11-16-fh-70pt5",
+            "active": true,
+            "marketType": "totals",
+            "closed": true,
+            "archived": false,
+            "sportsMarketType": "basketball_team_first_half_total",
+            "line": 70.5,
+            "status": "MARKET_STATUS_RESOLVED",
+            "title": "Over 70.5 total points in 1st half",
+            "marketSides": [
+              {
+                "description": "Over",
+                "long": true
+              },
+              {
+                "description": "Under",
+                "long": false
+              }
+            ]
+          },
+          {
+            "question": "Will Alcorn State score more than 57.5 points in Alcorn State vs. Maryland?",
+            "slug": "tsc-cbb-alcst-mary-2026-11-16-tt-alcst-fg-57pt5",
+            "active": true,
+            "marketType": "totals",
+            "closed": false,
+            "archived": false,
+            "sportsMarketType": "basketball_team_total_points",
+            "line": 57.5,
+            "status": "MARKET_STATUS_OPEN",
+            "title": "Alcorn State over 57.5 total points",
+            "marketSides": [
+              {
+                "description": "Over",
+                "long": true,
+                "teamId": 1964,
+                "team": {
+                  "name": "Alcorn State",
+                  "safeName": "Alcorn State"
+                }
+              },
+              {
+                "description": "Under",
+                "long": false,
+                "teamId": 1964,
+                "team": {
+                  "name": "Alcorn State",
+                  "safeName": "Alcorn State"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "spread": {
+      "event_ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD",
+      "title": "Alcorn St. vs Maryland: Spread",
+      "markets": [
+        {
+          "floor_strike": 58.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD59",
+          "title": "Maryland wins by over 58.5 points",
+          "yes_sub_title": "Maryland wins by over 58.5 points"
+        },
+        {
+          "floor_strike": 56.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD57",
+          "title": "Maryland wins by over 56.5 points",
+          "yes_sub_title": "Maryland wins by over 56.5 points"
+        },
+        {
+          "floor_strike": 51.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD52",
+          "title": "Maryland wins by over 51.5 points",
+          "yes_sub_title": "Maryland wins by over 51.5 points"
+        },
+        {
+          "floor_strike": 46.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD47",
+          "title": "Maryland wins by over 46.5 points",
+          "yes_sub_title": "Maryland wins by over 46.5 points"
+        },
+        {
+          "floor_strike": 41.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD42",
+          "title": "Maryland wins by over 41.5 points",
+          "yes_sub_title": "Maryland wins by over 41.5 points"
+        },
+        {
+          "floor_strike": 37.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD38",
+          "title": "Maryland wins by over 37.5 points",
+          "yes_sub_title": "Maryland wins by over 37.5 points"
+        },
+        {
+          "floor_strike": 34.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD35",
+          "title": "Maryland wins by over 34.5 points",
+          "yes_sub_title": "Maryland wins by over 34.5 points"
+        },
+        {
+          "floor_strike": 31.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD32",
+          "title": "Maryland wins by over 31.5 points",
+          "yes_sub_title": "Maryland wins by over 31.5 points"
+        },
+        {
+          "floor_strike": 27.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD28",
+          "title": "Maryland wins by over 27.5 points",
+          "yes_sub_title": "Maryland wins by over 27.5 points"
+        },
+        {
+          "floor_strike": 22.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD23",
+          "title": "Maryland wins by over 22.5 points",
+          "yes_sub_title": "Maryland wins by over 22.5 points"
+        },
+        {
+          "floor_strike": 17.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD18",
+          "title": "Maryland wins by over 17.5 points",
+          "yes_sub_title": "Maryland wins by over 17.5 points"
+        },
+        {
+          "floor_strike": 12.5,
+          "status": "active",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD13",
+          "title": "Maryland wins by over 12.5 points",
+          "yes_sub_title": "Maryland wins by over 12.5 points"
+        },
+        {
+          "floor_strike": 63.5,
+          "status": "initialized",
+          "ticker": "KXNCAAMBSPREAD-26NOV16ALCNMD-MD64",
+          "title": "Maryland wins by over 63.5 points",
+          "yes_sub_title": "Maryland wins by over 63.5 points"
+        }
+      ]
+    },
+    "total": {
+      "event_ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD",
+      "title": "Alcorn St. vs Maryland: Point Total",
+      "markets": [
+        {
+          "floor_strike": 126.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-127",
+          "title": "Full Game: Over 126.5 points scored",
+          "yes_sub_title": "Over 126.5 points"
+        },
+        {
+          "floor_strike": 131.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-132",
+          "title": "Full Game: Over 131.5 points scored",
+          "yes_sub_title": "Over 131.5 points"
+        },
+        {
+          "floor_strike": 136.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-137",
+          "title": "Full Game: Over 136.5 points scored",
+          "yes_sub_title": "Over 136.5 points"
+        },
+        {
+          "floor_strike": 140.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-141",
+          "title": "Full Game: Over 140.5 points scored",
+          "yes_sub_title": "Over 140.5 points"
+        },
+        {
+          "floor_strike": 144.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-145",
+          "title": "Full Game: Over 144.5 points scored",
+          "yes_sub_title": "Over 144.5 points"
+        },
+        {
+          "floor_strike": 147.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-148",
+          "title": "Full Game: Over 147.5 points scored",
+          "yes_sub_title": "Over 147.5 points"
+        },
+        {
+          "floor_strike": 150.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-151",
+          "title": "Full Game: Over 150.5 points scored",
+          "yes_sub_title": "Over 150.5 points"
+        },
+        {
+          "floor_strike": 152.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-153",
+          "title": "Full Game: Over 152.5 points scored",
+          "yes_sub_title": "Over 152.5 points"
+        },
+        {
+          "floor_strike": 154.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-155",
+          "title": "Full Game: Over 154.5 points scored",
+          "yes_sub_title": "Over 154.5 points"
+        },
+        {
+          "floor_strike": 157.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-158",
+          "title": "Full Game: Over 157.5 points scored",
+          "yes_sub_title": "Over 157.5 points"
+        },
+        {
+          "floor_strike": 160.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-161",
+          "title": "Full Game: Over 160.5 points scored",
+          "yes_sub_title": "Over 160.5 points"
+        },
+        {
+          "floor_strike": 164.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-165",
+          "title": "Full Game: Over 164.5 points scored",
+          "yes_sub_title": "Over 164.5 points"
+        },
+        {
+          "floor_strike": 168.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-169",
+          "title": "Full Game: Over 168.5 points scored",
+          "yes_sub_title": "Over 168.5 points"
+        },
+        {
+          "floor_strike": 173.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-174",
+          "title": "Full Game: Over 173.5 points scored",
+          "yes_sub_title": "Over 173.5 points"
+        },
+        {
+          "floor_strike": 174.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-175",
+          "title": "Full Game: Over 174.5 points scored",
+          "yes_sub_title": "Over 174.5 points"
+        },
+        {
+          "floor_strike": 175.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-176",
+          "title": "Full Game: Over 175.5 points scored",
+          "yes_sub_title": "Over 175.5 points"
+        },
+        {
+          "floor_strike": 180.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-181",
+          "title": "Full Game: Over 180.5 points scored",
+          "yes_sub_title": "Over 180.5 points"
+        },
+        {
+          "floor_strike": 185.5,
+          "status": "active",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-186",
+          "title": "Full Game: Over 185.5 points scored",
+          "yes_sub_title": "Over 185.5 points"
+        },
+        {
+          "floor_strike": 190.5,
+          "status": "initialized",
+          "ticker": "KXNCAAMBTOTAL-26NOV16ALCNMD-191",
+          "title": "Full Game: Over 190.5 points scored",
+          "yes_sub_title": "Over 190.5 points"
+        }
+      ]
+    }
+  },
+  "wcbb": {
+    "kalshi": {
+      "event_ticker": "KXNCAAWBGAME-26NOV15UCIEWU",
+      "title": "UC Irvine vs Eastern Washington",
+      "markets": [
+        {
+          "status": "active",
+          "ticker": "KXNCAAWBGAME-26NOV15UCIEWU-EWU",
+          "title": "Eastern Washington wins",
+          "yes_sub_title": "Eastern Washington"
+        },
+        {
+          "status": "active",
+          "ticker": "KXNCAAWBGAME-26NOV15UCIEWU-UCI",
+          "title": "UC Irvine wins",
+          "yes_sub_title": "UC Irvine"
+        }
+      ]
+    },
+    "polymarket": {
+      "event": {
+        "slug": "wcbb-ucirv-ewash-2026-11-15",
+        "title": "UC Irvine (W) vs. Eastern Washington (W)",
+        "startDate": "2026-11-17T02:00:00Z",
+        "markets": [
+          {
+            "question": "Who will win in the upcoming basketball event UC Irvine (W) vs Eastern Washington (W) scheduled for November 15, 2026 at 5:00PM ET?",
+            "slug": "aec-wcbb-ucirv-ewash-2026-11-15",
+            "active": true,
+            "marketType": "moneyline",
+            "closed": false,
+            "archived": false,
+            "sportsMarketType": "basketball_team_full_game_winner",
+            "status": "MARKET_STATUS_OPEN",
+            "title": "UC Irvine (W) vs Eastern Washington (W)",
+            "marketSides": [
+              {
+                "description": "Anteaters",
+                "long": true,
+                "teamId": 4477,
+                "team": {
+                  "name": "UC Irvine (W)",
+                  "safeName": "UC Irvine (W)"
+                }
+              },
+              {
+                "description": "Eagles",
+                "long": false,
+                "teamId": 4271,
+                "team": {
+                  "name": "Eastern Washington (W)",
+                  "safeName": "Eastern Washington (W)"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

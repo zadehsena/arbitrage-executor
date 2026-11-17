@@ -2,3 +2,6 @@
 *.log
 .env
 scanner-candidates.jsonl
+/fee-policy.json
+/settlement-approvals.json
+/market-reviews/
